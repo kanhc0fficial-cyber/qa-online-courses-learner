@@ -1,0 +1,33 @@
+# Runtime data: regenerate or download on the target machine.
+/downloads/
+/records/
+/course-workflow/data/lessons/
+/course-workflow/data/jobs/
+
+# Unused upstream development packages; they are outside the portable runtime path.
+/video-analyzer/video-analyzer-tune/
+/video-analyzer/video-analyzer-ui/
+/video-analyzer/.github/
+
+# Secrets and local authentication.
+.env
+.env.*
+!.env.example
+auth.toml
+cookies*.json
+*.session
+
+# Python and Node local state.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+dist/
+.next/
+
+# Logs and operating-system files.
+*.log
+Thumbs.db
+.DS_Store

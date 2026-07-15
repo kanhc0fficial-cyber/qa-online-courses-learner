@@ -1,0 +1,58 @@
+{
+    "clients": {
+        "default": "ollama",
+        "temperature": 0.0,
+        "ollama": {
+            "url": "http://localhost:11434",
+            "model": "llama3.2-vision"
+        },
+        "openai_api": {
+            "api_key": "",
+            "api_key_header": "Authorization",
+            "model": "meta-llama/llama-3.2-11b-vision-instruct",
+            "api_url": "https://openrouter.ai/api/v1"
+        }
+    },
+    "prompt_dir": "prompts",
+    "prompts": [
+        {
+            "name": "Frame Record",
+            "path": "frame_analysis/frame_analysis.txt"
+        },
+        {
+            "name": "Chronological Record",
+            "path": "frame_analysis/record.txt"
+        }
+    ],
+    "output_dir": "output",
+    "frames": {
+        "per_minute": 60,
+        "scene_threshold": 0.1,
+        "black_threshold": 10.0,
+        "hash_distance": 5,
+        "max_count": 30,
+        "start_stage": 1,
+        "max_frames": 2147483647
+    },
+    "response_length": {
+        "frame": 300,
+        "reconstruction": 1000,
+        "narrative": 500
+    },
+    "recording": {
+        "group_size": 6
+    },
+    "audio": {
+        "whisper_model": "medium",
+        "sample_rate": 16000,
+        "channels": 1,
+        "quality_threshold": 0.2,
+        "chunk_length": 30,
+        "language_confidence_threshold": 0.8,
+        "language": null,
+        "initial_prompt": "英语音标课程。元音、辅音、清音、浊音、调音部位、调音方式、双唇音、齿龈音、软腭音、塞音、爆破音、DJ音标、KK音标。",
+        "device": "cpu"
+    },
+    "keep_frames": true,
+    "prompt": ""
+}
