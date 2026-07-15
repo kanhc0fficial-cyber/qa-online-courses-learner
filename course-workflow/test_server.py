@@ -55,3 +55,16 @@ def test_parse_source_accepts_any_bilibili_bv_and_defaults_to_first_part():
     assert source_id == "BV1ab411c7xY"
     assert part == 1
     assert url == "https://www.bilibili.com/video/BV1ab411c7xY?p=1"
+
+
+def test_find_download_requires_video_and_subtitle(monkeypatch, tmp_path):
+    downloads = tmp_path / "downloads"
+    source = downloads / "BV1pS4y1g7D9-p16-720p"
+    source.mkdir(parents=True)
+    (source / "lesson.mp4").write_bytes(b"video")
+    monkeypatch.setattr(server, "PROJECT_ROOT", tmp_path)
+
+    assert server.find_download("BV1pS4y1g7D9", 16) is None
+
+    (source / "lesson.zh.srt").write_text("subtitle", encoding="utf-8")
+    assert server.find_download("BV1pS4y1g7D9", 16) == source
