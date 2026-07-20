@@ -4,7 +4,10 @@ import pytest
 
 from video_analyzer.lecture_document import (
     can_recover_lecture_draft_frames,
-    ensure_minimum_callouts, lecture_frame_markers, limit_callouts, limit_group_callouts,
+    document_text,
+    ensure_callout_kinds, ensure_document_text_retention, ensure_minimum_callouts,
+    restore_missing_source_number_sentences,
+    lecture_frame_markers, limit_callouts, limit_group_callouts,
     normalize_group_blocks,
     render_lecture_document, split_lecture_draft,
     thin_lecture_draft_frames,
@@ -95,7 +98,7 @@ def test_draft_frame_recovery_allows_reordering_and_missing_known_frames_only():
     duplicate = validate_lecture_draft_frames(
         "<!-- FRAME: 1 --><!-- FRAME: 1 -->", [1, 2]
     )
-    assert not can_recover_lecture_draft_frames(duplicate)
+    assert can_recover_lecture_draft_frames(duplicate)
 
     unexpected = validate_lecture_draft_frames(
         "<!-- FRAME: 1 --><!-- FRAME: 99 -->", [1, 2]
@@ -198,6 +201,163 @@ def test_significant_number_guard_ignores_digits_inside_asr_identifiers():
         group, [], source, minimum_text_ratio=0.17, require_source_numbers=True
     )
     assert result["valid"], result["errors"]
+
+
+def test_significant_number_guard_ignores_cross_frame_provenance():
+    group = {"sections": [{
+        "heading": "工作象限",
+        "blocks": [{
+            "type": "paragraph",
+            "text": "本页继续说明参考方向如何决定器件的工作象限，并强调应先统一电压和电流的参考方向。",
+        }],
+    }]}
+    source = (
+        "与 frame_number=11 内容相同，继续说明参考方向如何决定器件的工作象限，"
+        "并强调应先统一电压和电流的参考方向。"
+    )
+    result = validate_lecture_group(
+        group, [], source, minimum_text_ratio=0.17, require_source_numbers=True
+    )
+    assert result["valid"], result["errors"]
+
+
+def test_significant_number_guard_ignores_cross_frame_provenance_lists():
+    group = {"sections": [{
+        "heading": "工作象限",
+        "blocks": [{
+            "type": "paragraph",
+            "text": "内容与前面的画面完全相同；这些标记只描述采集来源。",
+        }],
+    }]}
+    source = (
+        "内容与 frame_number=10和11 完全相同，也对应第10帧和11帧，"
+        "以及 image 10, 11；这些数字只描述采集来源。"
+    )
+    result = validate_lecture_group(
+        group, [], source, minimum_text_ratio=0.17, require_source_numbers=True
+    )
+    assert result["valid"], result["errors"]
+
+
+def test_supplement_group_allows_narrow_text_retention_boundary_tolerance():
+    source = "甲" * 1829
+    group = {"sections": [{
+        "heading": "补充画面",
+        "blocks": [{"type": "paragraph", "text": "乙" * 296}],
+    }]}
+
+    result = validate_lecture_group(
+        group, [], source, minimum_text_ratio=0.17, require_source_numbers=True
+    )
+
+    assert result["valid"], result["errors"]
+
+
+def test_regular_group_allows_narrow_text_retention_boundary_tolerance():
+    source = "甲" * 565
+    group = {"sections": [{
+        "heading": "驱动电路",
+        "blocks": [{"type": "paragraph", "text": "乙" * 296}],
+    }]}
+
+    result = validate_lecture_group(
+        group, [], source, minimum_text_ratio=0.55, require_source_numbers=False
+    )
+
+    assert result["valid"], result["errors"]
+
+
+def test_numeric_repair_restores_the_source_sentence_without_inference():
+    group = {"sections": [{
+        "heading": "器件选型",
+        "blocks": [{"type": "paragraph", "text": "MOSFET常用于较低电压场合。"}],
+    }]}
+    source = (
+        "<!-- FRAME: 22 -->\n"
+        "这个器件一般用于500V甚至1500V以内，当然现在1kV的器件也有。"
+    )
+
+    restore_missing_source_number_sentences(
+        group, source, ["group_missing_source_numbers_1500"]
+    )
+
+    text = group["sections"][0]["blocks"][-1]["text"]
+    assert "原稿数值补充：" in text
+    assert "500V甚至1500V以内" in text
+    assert "<!-- FRAME" not in text
+
+
+def test_document_retention_repair_adds_clean_high_novelty_source_text():
+    document = _valid_document()
+    original = (
+        "<!-- FRAME: 1 -->\n\n"
+        + "那么这是需要完整保留的器件工作机理与实验条件。" * 100
+    )
+    before = len(document_text(document))
+
+    ensure_document_text_retention(
+        document,
+        original,
+        [f"structured_text_too_short_{before}_minimum_{before + 500}"],
+    )
+
+    assert document["sections"][-1]["heading"] == "原稿细节保留"
+    added = document["sections"][-1]["blocks"][0]["text"]
+    assert "器件工作机理与实验条件" in added
+    assert "那么" not in added
+    assert len(document_text(document)) >= before + 500
+
+
+def test_callout_kind_repair_relabels_only_redundant_callouts():
+    document = _valid_document()
+    for section in document["sections"]:
+        for block in section["blocks"]:
+            if block.get("type") == "callout":
+                block["kind"] = "definition"
+    original_text = [
+        block["text"]
+        for section in document["sections"]
+        for block in section["blocks"]
+        if block.get("type") == "callout"
+    ]
+
+    ensure_callout_kinds(document)
+
+    callouts = [
+        block
+        for section in document["sections"]
+        for block in section["blocks"]
+        if block.get("type") == "callout"
+    ]
+    assert {block["kind"] for block in callouts} == {
+        "definition", "derivation", "conclusion", "warning"
+    }
+    assert [block["text"] for block in callouts] == original_text
+
+
+def test_short_lecture_scales_structure_thresholds_to_source_size():
+    document = _valid_document()
+    document["sections"] = document["sections"][:5]
+    frame = 1
+    for section in document["sections"]:
+        section["blocks"] = [
+            block for block in section["blocks"] if block.get("type") != "frame"
+        ]
+        section["blocks"].append({"type": "frame", "frame_number": frame})
+        frame += 1
+    text_blocks = [
+        block
+        for section in document["sections"]
+        for block in section["blocks"]
+        if block.get("type") in {"paragraph", "callout", "subheading"}
+    ]
+    for block in text_blocks:
+        block["text"] += " **补充重点**"
+
+    result = validate_lecture_document(document, [1, 2, 3, 4, 5], "原稿" * 1000)
+
+    assert not any("need_at_least_7_sections" in error for error in result["errors"])
+    assert result["metrics"]["minimum_bold_pairs"] == 10
 
 
 def test_normalize_group_blocks_flattens_nested_content_without_losing_it():

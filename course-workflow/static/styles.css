@@ -27,15 +27,18 @@ button { color: inherit; }
 a { color: inherit; text-decoration: none; }
 .shell { width: min(1460px, calc(100% - 40px)); margin: auto; padding: 25px 0 60px; }
 .site-header { display: grid; grid-template-columns: 56px 1fr auto; gap: 16px; align-items: center; margin-bottom: 30px; }
-.logo { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 50%; color: white; background: var(--green); font: 800 16px/1 Georgia, serif; box-shadow: 4px 4px 0 var(--lime); }
+.logo { width: 52px; height: 52px; display: grid; place-items: center; overflow: hidden; border-radius: 50%; background: var(--green); box-shadow: 4px 4px 0 var(--lime); }
+.logo img { width: 82px; height: 82px; max-width: none; object-fit: cover; }
 .eyebrow { margin: 0 0 5px; color: var(--green); font-size: 10px; font-weight: 900; letter-spacing: .17em; text-transform: uppercase; }
 .site-header h1 { margin: 0; font: 700 clamp(24px, 3vw, 38px)/1 Georgia, "Songti SC", serif; letter-spacing: -.035em; }
 .series-lock { display: flex; gap: 11px; align-items: center; padding: 9px 13px; border: 1px solid var(--line); background: rgba(251, 248, 239, .75); color: var(--muted); font-size: 11px; }
 .lock-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--lime); box-shadow: 0 0 0 4px rgba(206, 241, 90, .28); }
-.hero { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(330px, .7fr); gap: 24px; margin-bottom: 28px; }
+.hero { display: grid; grid-template-columns: minmax(420px, .8fr) minmax(680px, 1.2fr); gap: 24px; margin-bottom: 28px; }
+.task-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
 .hero-copy, .submit-card, .lesson-card, .jobs-panel, .player-card, .lesson-sidebar, .content-panel { border: 1px solid rgba(22, 38, 31, .15); background: rgba(251, 248, 239, .92); box-shadow: var(--shadow); }
 .hero-copy { min-height: 400px; display: flex; flex-direction: column; justify-content: space-between; padding: clamp(28px, 5vw, 64px); overflow: hidden; position: relative; }
-.hero-copy::after { content: "02"; position: absolute; right: -18px; bottom: -58px; color: rgba(23, 75, 57, .06); font: 800 260px/1 Georgia, serif; pointer-events: none; }
+.hero-illustration { position: absolute; right: clamp(18px, 4vw, 56px); bottom: 25px; width: min(51%, 440px); opacity: .72; mix-blend-mode: multiply; pointer-events: none; }
+.hero-copy > div { position: relative; z-index: 1; }
 .hero-copy h2 { max-width: 780px; margin: 10px 0 20px; font: 700 clamp(38px, 6vw, 78px)/.98 Georgia, "Songti SC", serif; letter-spacing: -.055em; }
 .hero-copy h2 em { color: var(--orange); font-style: normal; }
 .hero-copy > p { max-width: 680px; color: var(--muted); font-size: 15px; line-height: 1.8; }
@@ -44,6 +47,7 @@ a { color: inherit; text-decoration: none; }
 .flow-step span { display: block; margin-bottom: 11px; color: var(--orange); font: 800 10px/1 ui-monospace, monospace; }
 .flow-step strong { font-size: 12px; }
 .submit-card { padding: 30px; background: var(--green); color: white; }
+.batch-card { background: #203d34; }
 .submit-card .eyebrow { color: var(--lime); }
 .submit-card h3 { margin: 8px 0 11px; font: 700 29px/1.1 Georgia, "Songti SC", serif; }
 .submit-card > p { margin: 0 0 25px; color: rgba(255,255,255,.68); font-size: 12px; line-height: 1.7; }
@@ -53,6 +57,9 @@ a { color: inherit; text-decoration: none; }
 .field input::placeholder { color: rgba(255,255,255,.38); }
 .field input:focus { border-color: var(--lime); box-shadow: 0 0 0 3px rgba(206,241,90,.12); }
 .field-row { display: grid; grid-template-columns: 120px 1fr; gap: 12px; align-items: end; }
+.range-fields { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+.download-policy { min-height: 45px; display: flex; justify-content: space-between; align-items: center; margin: 2px 0 5px; padding: 10px 13px; border: 1px solid rgba(255,255,255,.2); color: rgba(255,255,255,.72); font-size: 11px; }
+.download-policy strong { color: var(--lime); }
 .check-field { min-height: 49px; display: flex; gap: 9px; align-items: center; color: rgba(255,255,255,.72); font-size: 11px; }
 .check-field input { accent-color: var(--lime); }
 .submit-button, .primary-button { min-height: 50px; border: 0; padding: 12px 18px; color: var(--green); background: var(--lime); font-weight: 900; cursor: pointer; box-shadow: 5px 5px 0 rgba(0,0,0,.22); }
@@ -63,6 +70,23 @@ a { color: inherit; text-decoration: none; }
 .section-head { display: flex; justify-content: space-between; align-items: end; gap: 18px; margin: 34px 0 15px; }
 .section-head h2 { margin: 4px 0 0; font: 700 27px/1.1 Georgia, "Songti SC", serif; }
 .section-head span { color: var(--muted); font-size: 11px; }
+.course-display-head { align-items: center; }
+.display-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; align-items: center; }
+.layout-button { min-height: 35px; border: 1px solid var(--green); padding: 7px 12px; color: white; background: var(--green); cursor: pointer; font-size: 10px; font-weight: 900; }
+.layout-button.subtle { color: var(--green); background: transparent; }
+.course-shelves { display: grid; gap: 28px; }
+.course-shelf { padding: 22px; border: 1px solid rgba(22,38,31,.15); background: rgba(251,248,239,.74); box-shadow: var(--shadow); }
+.shelf-header { display: flex; justify-content: space-between; gap: 20px; align-items: end; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.shelf-header h3 { margin: 5px 0 7px; font: 700 25px/1.15 Georgia,"Songti SC",serif; }
+.shelf-header > div > p:last-child { margin: 0; color: var(--muted); font-size: 10px; }
+.shelf-header a { color: var(--orange); border-bottom: 1px solid currentColor; }
+.shelf-controls, .lesson-order-controls { display: flex; gap: 7px; }
+.shelf-controls button, .lesson-order-controls button { min-height: 32px; border: 1px solid var(--line); padding: 6px 9px; color: var(--green); background: white; cursor: pointer; font-size: 9px; font-weight: 900; }
+.shelf-controls button:disabled, .lesson-order-controls button:disabled { opacity: .35; cursor: not-allowed; }
+.shelf-title-input { width: min(520px,70vw); min-height: 42px; border: 1px solid var(--green); padding: 8px 11px; color: var(--ink); background: white; font: 700 20px/1.15 Georgia,"Songti SC",serif; }
+.lesson-adjust-item { display: grid; gap: 8px; }
+.lesson-adjust-item .lesson-card { width: 100%; }
+.lesson-order-controls { justify-content: flex-end; }
 .lesson-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 16px; }
 .lesson-card { min-height: 230px; display: flex; flex-direction: column; padding: 22px; transition: transform .2s ease, box-shadow .2s ease; }
 .lesson-card:hover { transform: translateY(-3px); box-shadow: 0 28px 70px rgba(35,47,40,.15); }
@@ -74,10 +98,14 @@ a { color: inherit; text-decoration: none; }
 .lesson-meta { display: flex; gap: 15px; margin-top: auto; padding-top: 22px; border-top: 1px solid var(--line); font: 700 10px/1 ui-monospace, monospace; color: var(--muted); }
 .lesson-arrow { margin-left: auto; color: var(--orange); font-size: 18px; }
 .jobs-panel { padding: 22px; }
+.task-status-head { margin-top: 10px; }
+.prominent-jobs { margin-bottom: 34px; border-top: 4px solid var(--orange); }
 .job-list { display: grid; gap: 10px; }
 .job { display: grid; grid-template-columns: 72px minmax(0,1fr) auto; gap: 15px; align-items: center; padding: 14px; border: 1px solid var(--line); background: white; }
 .job strong { font-size: 12px; }
+.job-kind { display: block; margin-top: 5px; color: var(--muted); font: 700 8px/1.2 ui-monospace, monospace; }
 .job-copy { display: grid; gap: 7px; }
+.job-copy .job-source { color: var(--green); font-size: 10px; letter-spacing: .04em; }
 .job-copy span { color: var(--muted); font-size: 11px; }
 .job-progress { height: 5px; background: #e6e2d8; overflow: hidden; }
 .job-progress i { display: block; height: 100%; background: var(--orange); transition: width .4s ease; }
@@ -206,6 +234,7 @@ a { color: inherit; text-decoration: none; }
 .loading-screen { min-height:100vh; display:grid; place-content:center; gap:15px; color:var(--muted); font-size:12px; text-align:center; }
 .pulse { width:38px; height:38px; margin:auto; border-radius:50%; background:var(--green); box-shadow:0 0 0 0 rgba(206,241,90,.8); animation:pulse 1.3s infinite; }
 @keyframes pulse { 70% { box-shadow:0 0 0 18px rgba(206,241,90,0); } 100% { box-shadow:0 0 0 0 rgba(206,241,90,0); } }
-@media (max-width: 980px) { .hero,.lesson-layout { grid-template-columns:1fr; }.flow-strip { grid-template-columns:repeat(3,1fr); }.lesson-sidebar { order:2; } }
-@media (max-width: 650px) { .shell{width:min(100% - 22px,1460px);padding-top:15px}.site-header{grid-template-columns:46px 1fr}.logo{width:42px;height:42px}.series-lock{grid-column:1/-1}.hero-copy,.submit-card{padding:24px}.hero-copy{min-height:0}.flow-strip{grid-template-columns:1fr 1fr}.job{grid-template-columns:55px 1fr}.job-status{display:none}.volume-boost{align-items:stretch;flex-direction:column}.volume-boost-options{display:grid;grid-template-columns:repeat(3,1fr)}.volume-boost-options button{min-width:0}.player-info{align-items:start}.quiz-modal{padding:25px 18px}.quiz-header{flex-direction:column}.options{grid-template-columns:1fr}.quiz-footer{align-items:stretch;flex-direction:column}.primary-button{width:100%}.article-toolbar{align-items:stretch;flex-direction:column}.article-toolbar label{width:100%;min-width:0}.article-time-block{grid-template-columns:1fr;gap:10px;padding:14px}.article-timeline::before{display:none}.article-time-rail{align-items:center;flex-direction:row}.subtitle-chip{top:auto;bottom:42px}.modal-note-toolbar{align-items:stretch;flex-direction:column}.modal-note-toolbar label{min-width:0}.question-heading{align-items:start}.modal-view-tabs button{flex:1}.confirm-actions{align-items:stretch;flex-direction:column}.confirm-actions>*{width:100%;justify-content:center}.confirm-modal{padding:26px 20px} }
+@media (max-width: 1180px) { .hero,.lesson-layout { grid-template-columns:1fr; }.flow-strip { grid-template-columns:repeat(3,1fr); }.lesson-sidebar { order:2; } }
+@media (max-width: 760px) { .task-cards { grid-template-columns:1fr; } }
+@media (max-width: 650px) { .shell{width:min(100% - 22px,1460px);padding-top:15px}.site-header{grid-template-columns:46px 1fr}.logo{width:42px;height:42px}.series-lock{grid-column:1/-1}.hero-copy,.submit-card{padding:24px}.hero-copy{min-height:0}.flow-strip{grid-template-columns:1fr 1fr}.job{grid-template-columns:55px 1fr}.job-status{display:none}.volume-boost{align-items:stretch;flex-direction:column}.volume-boost-options{display:grid;grid-template-columns:repeat(3,1fr)}.volume-boost-options button{min-width:0}.player-info{align-items:start}.quiz-modal{padding:25px 18px}.quiz-header{flex-direction:column}.options{grid-template-columns:1fr}.quiz-footer{align-items:stretch;flex-direction:column}.primary-button{width:100%}.article-toolbar{align-items:stretch;flex-direction:column}.article-toolbar label{width:100%;min-width:0}.article-time-block{grid-template-columns:1fr;gap:10px;padding:14px}.article-timeline::before{display:none}.article-time-rail{align-items:center;flex-direction:row}.subtitle-chip{top:auto;bottom:42px}.modal-note-toolbar{align-items:stretch;flex-direction:column}.modal-note-toolbar label{min-width:0}.question-heading{align-items:start}.modal-view-tabs button{flex:1}.confirm-actions{align-items:stretch;flex-direction:column}.confirm-actions>*{width:100%;justify-content:center}.confirm-modal{padding:26px 20px}.course-display-head,.shelf-header{align-items:stretch;flex-direction:column}.display-actions{justify-content:flex-start}.course-shelf{padding:14px}.shelf-title-input{width:100%} }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}

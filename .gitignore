@@ -1,8 +1,7 @@
 # Runtime data: regenerate or download on the target machine.
 /downloads/
 /records/
-/course-workflow/data/lessons/
-/course-workflow/data/jobs/
+/course-workflow/data/
 
 # Unused upstream development packages; they are outside the portable runtime path.
 /video-analyzer/video-analyzer-tune/

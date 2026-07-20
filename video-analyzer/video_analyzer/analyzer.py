@@ -76,6 +76,63 @@ LECTURE_SLIDE_GROUP_PROMPT = """你正在逐页记录一堂大学课程的PPT。
 这是课程记录，不是概括任务。不能为了简洁而省掉PPT上的推导条件、公式、图中标注和对比关系。不要补充画面外知识。
 """
 
+PHONETICS_OCR_GROUP_PROMPT = """你正在通过画面 OCR 记录一堂音标课程。图片按时间顺序提供：
+{FRAME_INDEX}
+
+只返回JSON，顶层必须是 {"scenes": [...]}，每张图对应一个scene。不得使用字幕、语音转写或画面外知识。每个scene包含：
+- frame_number：列表中的整数；
+- timestamp：列表中的秒数；
+- slide_title：画面上可读的主题或音标；没有则为空字符串；
+- visible_facts：2至6条画面直接支持的教学事实；
+- screen_text：0至16条重要原文，保持中文、英文和 IPA 原样，不要自动纠正；
+- ipa_symbols：画面中全部可辨认的 IPA 符号；斜杠或方括号属于原文时保留；
+- examples：画面明确建立的例词、字母组合、音标或中文提示对应关系；
+- articulation_cues：画面明确标注的口型、舌位、唇形、声带或气流提示；
+- relevance：content、duplicate或noise；
+- uncertainties：模糊、遮挡或字形相近而无法确认的内容。
+
+音标字符必须逐字识别，特别区分 /iː/ 与 /ɪ/、/uː/ 与 /ʊ/、/ə/ 与 /ɜː/、
+/s/ 与 /ʃ/、/z/ 与 /ʒ/、/θ/ 与 /ð/。无法确认时写入 uncertainties，禁止猜测。
+不要把老师的嘴型动作推断成某个发音；只有画面文字或图示明确标注时才写入 articulation_cues。
+"""
+
+PHONETICS_CAPTION_OCR_PROMPT = """你正在逐段 OCR 音标课程画面底部的内嵌字幕区域。图片顺序如下：
+{FRAME_INDEX}
+
+只返回 JSON：{"segments": [...]}，每张图必须对应一个 segment，顺序和数量完全一致。
+每个 segment 包含：
+- frame_number：复制列表中的整数；
+- timestamp：复制列表中的秒数；
+- has_caption：画面中是否存在课程制作方加入的字幕、彩色提示词或发音标签；
+- caption_text：按阅读顺序逐字抄录全部字幕，保留中文、英文、IPA、标点和括号；
+- lines：按画面换行拆分的字符串数组；
+- uncertainties：无法辨认的字形及其位置；完全可读时为空数组。
+
+忽略水印、网站名、固定页脚和播放器元素。不得依据语音补字，不得把相似音标自动纠正。
+即使内容与上一张相同也必须完整返回，禁止合并或省略任何图片。
+"""
+
+PHONETICS_ARTICLE_PROMPT = """你是一名音标课程记录编辑。请只依据下面按时间排列的 OCR 场景记录，写成一篇可审计的中文课程记录。
+
+硬性要求：
+- OCR 是唯一事实源；不得引用字幕、语音转写、常识或外部音标知识。
+- 保持 IPA 符号、英文例词、字母组合和中文提示的原始写法，不自动纠错。
+- 只陈述画面明确建立的对应关系；字形不确定时明确标注，不得猜测。
+- 按教学顺序组织内容，并在每个 relevance=content 的场景对应段落前插入一次
+  `<!-- FRAME: N -->`；N 只能来自 frame_number，不得重复或改序。
+- 使用一个一级标题及必要的二、三级标题；不得使用“报告”“分析”“摘要”“总结”作为标题。
+- 这是完整课程记录，不是逐帧流水账；可合并完全重复画面，但不得省略新出现的音标、
+  例词、对照关系或发音部位提示。
+
+OCR 场景记录：
+{SCENES}
+
+逐段字幕 OCR 时间线：
+{OCR_TIMELINE}
+
+只输出 Markdown 正文，不要解释过程，不要使用代码围栏。
+"""
+
 LECTURE_ARTICLE_PROMPT = """你是一名严谨的课程记录编辑。请把下面的“逐页PPT记录”和“带时间的完整字幕”重组为一篇可直接发布的中文公众号文章。
 
 这不是摘要，也不是提纲。首要目标是完整保留老师实际讲授的内容，连贯性排在完整性之后；不得为了文章简短、结构漂亮或避免重复而删掉有教学意义的信息。
@@ -504,6 +561,108 @@ class VideoAnalyzer:
                 "uncertainties": [f"Lecture slide group failed: {exc}"]
             }, frame, transcript) for frame in frames]
 
+    def analyze_phonetics_frame_group(
+        self,
+        frames: List[Frame],
+    ) -> List[Dict[str, Any]]:
+        """Ground mixed Chinese, English, and IPA exclusively in frame OCR."""
+        frame_index = "\n".join(
+            f"- image {index + 1}: frame_number={frame.number}, timestamp={frame.timestamp:.3f}"
+            for index, frame in enumerate(frames)
+        )
+        prompt = PHONETICS_OCR_GROUP_PROMPT.replace("{FRAME_INDEX}", frame_index)
+        try:
+            response = self.client.generate(
+                prompt=prompt,
+                image_paths=[str(frame.path) for frame in frames],
+                response_format={"type": "json_object"},
+                model=self.model,
+                temperature=0.0,
+                num_predict=max(1600, len(frames) * 650),
+            )
+            self.call_log.append({
+                "purpose": "phonetics_ocr_scene_record",
+                "evidence_mode": "ocr_primary",
+                "frame_numbers": [frame.number for frame in frames],
+                "model": response.get("model", self.model),
+                "usage": response.get("usage"),
+                "finish_reason": response.get("finish_reason"),
+                "response_excerpt": str(response.get("response", ""))[:4000],
+            })
+            parsed = self._parse_json_response(response)
+            scenes = parsed.get("scenes", []) if parsed else []
+            if not isinstance(scenes, list) or len(scenes) != len(frames):
+                raise ValueError(
+                    f"Expected {len(frames)} OCR scenes, received "
+                    f"{len(scenes) if isinstance(scenes, list) else 0}"
+                )
+            normalized = []
+            for scene, frame in zip(scenes, frames):
+                source = scene if isinstance(scene, dict) else {}
+                item = self._normalize_scene(source, frame, None)
+                item["slide_title"] = str(source.get("slide_title", "")).strip()
+                for key in ("ipa_symbols", "examples", "articulation_cues"):
+                    value = source.get(key, [])
+                    item[key] = value if isinstance(value, list) else ([str(value)] if value else [])
+                item["relevance"] = source.get("relevance", "content")
+                item["evidence_mode"] = "ocr_primary"
+                normalized.append(item)
+            return normalized
+        except Exception as exc:
+            logger.error("Error analyzing phonetics OCR frame group: %s", exc)
+            return [self._normalize_scene({
+                "uncertainties": [f"Phonetics OCR frame group failed: {exc}"]
+            }, frame, None) for frame in frames]
+
+    def analyze_phonetics_caption_group(
+        self,
+        frames: List[Frame],
+    ) -> List[Dict[str, Any]]:
+        frame_index = "\n".join(
+            f"- image {index + 1}: frame_number={frame.number}, timestamp={frame.timestamp:.3f}"
+            for index, frame in enumerate(frames)
+        )
+        prompt = PHONETICS_CAPTION_OCR_PROMPT.replace("{FRAME_INDEX}", frame_index)
+        response = self.client.generate(
+            prompt=prompt,
+            image_paths=[str(frame.path) for frame in frames],
+            response_format={"type": "json_object"},
+            model=self.model,
+            temperature=0.0,
+            num_predict=max(1400, len(frames) * 420),
+        )
+        self.call_log.append({
+            "purpose": "phonetics_dense_caption_ocr",
+            "evidence_mode": "ocr_primary",
+            "frame_numbers": [frame.number for frame in frames],
+            "model": response.get("model", self.model),
+            "usage": response.get("usage"),
+            "finish_reason": response.get("finish_reason"),
+            "response_excerpt": str(response.get("response", ""))[:4000],
+        })
+        parsed = self._parse_json_response(response)
+        segments = parsed.get("segments", []) if parsed else []
+        if not isinstance(segments, list) or len(segments) != len(frames):
+            raise ValueError(
+                f"Expected {len(frames)} caption OCR segments, received "
+                f"{len(segments) if isinstance(segments, list) else 0}"
+            )
+        normalized = []
+        for segment, frame in zip(segments, frames):
+            source = segment if isinstance(segment, dict) else {}
+            lines = source.get("lines", [])
+            uncertainties = source.get("uncertainties", [])
+            normalized.append({
+                "frame_number": frame.number,
+                "timestamp": frame.timestamp,
+                "has_caption": bool(source.get("has_caption", False)),
+                "caption_text": str(source.get("caption_text", "")).strip(),
+                "lines": lines if isinstance(lines, list) else [],
+                "uncertainties": uncertainties if isinstance(uncertainties, list) else [],
+                "evidence_mode": "ocr_primary",
+            })
+        return normalized
+
     def analyze_frames(self, frames: List[Frame], transcript: Optional[AudioTranscript] = None,
                        group_size: int = 6) -> List[Dict[str, Any]]:
         analyses: List[Dict[str, Any]] = []
@@ -628,6 +787,50 @@ class VideoAnalyzer:
             return str(response.get("response", "")).strip()
         except Exception as exc:
             logger.error("Error composing complete lecture article: %s", exc)
+            return f"# 课程记录生成失败\n\n{exc}"
+
+    def compose_phonetics_article(
+        self,
+        scenes: List[Dict[str, Any]],
+        ocr_timeline: List[Dict[str, Any]],
+        source_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        source_scenes = [{
+            "frame_number": scene.get("frame_number"),
+            "timestamp": scene.get("timestamp"),
+            "slide_title": scene.get("slide_title", ""),
+            "visible_facts": scene.get("visible_facts", []),
+            "screen_text": scene.get("screen_text", []),
+            "ipa_symbols": scene.get("ipa_symbols", []),
+            "examples": scene.get("examples", []),
+            "articulation_cues": scene.get("articulation_cues", []),
+            "relevance": scene.get("relevance", "content"),
+            "uncertainties": scene.get("uncertainties", []),
+        } for scene in scenes]
+        prompt = PHONETICS_ARTICLE_PROMPT.replace(
+            "{SCENES}", json.dumps(source_scenes, ensure_ascii=False)
+        ).replace(
+            "{OCR_TIMELINE}", json.dumps(ocr_timeline, ensure_ascii=False)
+        )
+        if source_context:
+            prompt = "来源元数据：\n" + json.dumps(source_context, ensure_ascii=False) + "\n\n" + prompt
+        try:
+            response = self.client.generate(
+                prompt=prompt,
+                model=self.model,
+                temperature=0.0,
+                num_predict=8000,
+            )
+            self.call_log.append({
+                "purpose": "phonetics_ocr_article",
+                "evidence_mode": "ocr_primary",
+                "model": response.get("model", self.model),
+                "usage": response.get("usage"),
+                "finish_reason": response.get("finish_reason"),
+            })
+            return str(response.get("response", "")).strip()
+        except Exception as exc:
+            logger.error("Error composing phonetics OCR article: %s", exc)
             return f"# 课程记录生成失败\n\n{exc}"
 
     def repair_lecture_article_coverage(

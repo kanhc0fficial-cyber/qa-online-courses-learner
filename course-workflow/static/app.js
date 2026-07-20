@@ -5,10 +5,12 @@ const VOLUME_BOOST_LEVELS = [1, 1.5, 2];
 const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[ch]));
 const formatTime = seconds => `${String(Math.floor(seconds / 60)).padStart(2,"0")}:${String(Math.floor(seconds % 60)).padStart(2,"0")}`;
 const normalize = value => String(value || "").toLowerCase().replace(/[\s（）()·。；;，,′'"“”]/g, "").replace(/ₛ/g,"s");
+let layoutEditing = false;
+let homeLayout = {source_order:[], lesson_order:{}, titles:{}};
 
 function header(extra = "") {
   return `<header class="site-header">
-    <a class="logo" href="/">PE</a>
+    <a class="logo" href="/" aria-label="返回课程工坊首页"><img src="/static/course-flow.svg" alt=""></a>
     <div><p class="eyebrow">POWER ELECTRONICS · LESSON FORGE</p><h1>互动课程工坊</h1></div>
     ${extra || `<div class="series-lock"><i class="lock-dot"></i><span>任意 B 站视频</span></div>`}
   </header>`;
@@ -105,16 +107,23 @@ async function jsonFetch(url, options) {
 }
 
 async function dashboard() {
-  const data = await jsonFetch("/api/series");
+  const [data, layout] = await Promise.all([
+    jsonFetch("/api/series"),
+    jsonFetch("/api/home-layout"),
+  ]);
+  homeLayout = layout;
+  const shelves = buildCourseShelves(data.lessons, homeLayout);
   app.innerHTML = `<main class="shell">
     ${header()}
     <section class="hero">
       <div class="hero-copy">
-        <div><p class="eyebrow">ONE VIDEO · ONE WORKFLOW · ONE URL</p><h2>从视频链接到<br><em>可互动课程</em></h2><p>支持任意 B 站 BV 视频。可选择完整 PPT 记录和严格课程校验；关闭后会使用通用视频路径，仍保留格式、时间戳和可作答性校验。</p></div>
+        <img class="hero-illustration" src="/static/course-flow.svg" alt="课程知识路径图" loading="eager">
+        <div><p class="eyebrow">ONE VIDEO · ONE WORKFLOW · ONE URL</p><h2>从视频链接到<br><em>可互动课程</em></h2><p>支持任意 B 站 BV 视频。音标课程使用画面 OCR 作为唯一事实源，不读取中英混杂字幕。</p></div>
         <div class="flow-strip">
           ${["校验系列","下载字幕","理解 PPT","教案与题目","网址播放"].map((x,i)=>`<div class="flow-step"><span>0${i+1}</span><strong>${x}</strong></div>`).join("")}
         </div>
       </div>
+      <div class="task-cards">
       <form class="submit-card" id="job-form">
         <p class="eyebrow">NEW VIDEO</p><h3>制作一节互动课</h3><p>粘贴任意 B 站视频链接或 BV 号；单集视频无需填写分集。</p>
         <div class="field"><label for="source">B站视频链接或 BV 号</label><input id="source" name="source" required placeholder="https://www.bilibili.com/video/BV... ?p=1"></div>
@@ -122,18 +131,127 @@ async function dashboard() {
           <div class="field"><label for="part">分集 P</label><input id="part" name="part" type="number" min="1" placeholder="9"></div>
           <label class="check-field"><input id="reuse" type="checkbox" checked> 优先复用已下载视频</label>
         </div>
-        <label class="check-field"><input id="ppt-complete" type="checkbox" checked> 完整 PPT 记录（仅稳定投影片画面）</label>
-        <label class="check-field"><input id="strict-validation" type="checkbox" checked> 严格课程校验包（逐页覆盖、来源保真与文章结构）</label>
+        <div class="field"><label for="validation-profile">课程链路</label><select id="validation-profile" name="validationProfile"><option value="strict_course">严格课程（PPT + 字幕）</option><option value="phonetics_course">音标课程（OCR，不用字幕）</option><option value="general_video">通用视频</option></select></div>
+        <label class="check-field"><input id="ppt-complete" type="checkbox" checked> 完整 PPT 记录（音标课程会自动关闭）</label>
         <button class="submit-button" type="submit">开始自动制作 →</button><p class="form-message" id="form-message"></p>
       </form>
+      <form class="submit-card batch-card" id="batch-form">
+        <p class="eyebrow">MULTI-P WORKFLOW</p><h3>处理多个分集</h3><p>指定起止 P，可仅下载资源，也可继续并行或串行制作课程。</p>
+        <div class="field"><label for="batch-source">B站视频链接或 BV 号</label><input id="batch-source" name="source" required placeholder="BV... 或视频链接"></div>
+        <div class="range-fields">
+          <div class="field"><label for="start-part">从 P</label><input id="start-part" name="startPart" type="number" min="1" max="999" required value="1"></div>
+          <div class="field"><label for="end-part">到 P</label><input id="end-part" name="endPart" type="number" min="1" max="999" required value="1"></div>
+        </div>
+        <div class="field"><label for="batch-action">任务模式</label><select id="batch-action" name="batchAction"><option value="download">仅下载资源</option><option value="course">下载并制作课程</option></select></div>
+        <div class="field"><label for="execution-mode">执行方式</label><select id="execution-mode" name="executionMode"><option value="serial">串行（逐个执行）</option><option value="parallel">并发（最多同时 3 个）</option></select></div>
+        <div id="batch-course-options" hidden>
+          <div class="field"><label for="batch-validation-profile">课程链路</label><select id="batch-validation-profile"><option value="strict_course">严格课程（PPT + 字幕）</option><option value="phonetics_course">音标课程（OCR，不用字幕）</option><option value="general_video">通用视频</option></select></div>
+          <label class="check-field"><input id="batch-ppt-complete" type="checkbox" checked> 完整 PPT 记录（音标课程会自动关闭）</label>
+        </div>
+        <div class="download-policy"><span>新下载清晰度</span><strong>720p 固定</strong></div>
+        <label class="check-field"><input id="batch-reuse" type="checkbox" checked> 已下载的分集直接复用</label>
+        <button class="submit-button" type="submit">开始批量下载 →</button><p class="form-message" id="batch-message"></p>
+      </form>
+      </div>
     </section>
-    <div class="section-head"><div><p class="eyebrow">READY TO LEARN</p><h2>已完成课程</h2></div><span>${data.lessons.length} 节可播放</span></div>
-    <section class="lesson-grid">${data.lessons.length ? data.lessons.map(lessonCard).join("") : `<div class="empty">尚无完成课程</div>`}</section>
-    <div class="section-head"><div><p class="eyebrow">PIPELINE STATUS</p><h2>制作任务</h2></div><span>失败会停在第一个确定性错误，不自动重复调用模型</span></div>
-    <section class="jobs-panel"><div class="job-list" id="job-list">${renderJobs(data.jobs)}</div></section>
+    <div class="section-head task-status-head"><div><p class="eyebrow">PIPELINE STATUS</p><h2>当前与最近任务</h2></div><span>失败现场会保留；可恢复的音标 OCR 从已完成段继续</span></div>
+    <section class="jobs-panel prominent-jobs"><div class="job-list" id="job-list">${renderJobs(data.jobs)}</div></section>
+    <div class="section-head course-display-head"><div><p class="eyebrow">READY TO LEARN</p><h2>课程陈列</h2></div><div class="display-actions"><span>${shelves.length} 个陈列 · ${data.lessons.length} 节可播放</span><button class="layout-button" id="layout-toggle">${layoutEditing ? "完成调整" : "调整陈列"}</button>${layoutEditing ? `<button class="layout-button subtle" id="layout-reset">恢复默认排序</button>` : ""}</div></div>
+    <section class="course-shelves">${shelves.length ? shelves.map((shelf,index)=>courseShelf(shelf,index,shelves.length)).join("") : `<div class="empty">尚无完成课程</div>`}</section>
   </main>`;
   bindJobForm();
+  bindBatchForm();
+  bindLayoutControls(shelves);
   if (data.jobs.some(job => ["queued","running"].includes(job.status))) pollDashboard();
+}
+
+function buildCourseShelves(lessons, layout) {
+  const groups = new Map();
+  lessons.forEach(lesson => {
+    const sourceId = lesson.series_id || String(lesson.source_url || "").split("?")[0] || "未分类";
+    if (!groups.has(sourceId)) groups.set(sourceId, []);
+    groups.get(sourceId).push(lesson);
+  });
+  const defaultSources = [...groups.keys()];
+  const sourceOrder = [
+    ...(layout.source_order || []).filter(sourceId => groups.has(sourceId)),
+    ...defaultSources.filter(sourceId => !(layout.source_order || []).includes(sourceId)),
+  ];
+  return sourceOrder.map(sourceId => {
+    const defaultLessons = groups.get(sourceId).slice().sort((a,b) =>
+      Number(a.part || 0) - Number(b.part || 0) || String(a.id).localeCompare(String(b.id))
+    );
+    const customOrder = layout.lesson_order?.[sourceId] || [];
+    const byId = new Map(defaultLessons.map(lesson => [lesson.id, lesson]));
+    const ordered = [
+      ...customOrder.map(id => byId.get(id)).filter(Boolean),
+      ...defaultLessons.filter(lesson => !customOrder.includes(lesson.id)),
+    ];
+    const sourceUrl = String(ordered[0]?.source_url || "").split("?")[0];
+    return {
+      sourceId,
+      sourceUrl,
+      title: layout.titles?.[sourceId] || `课程系列 · ${sourceId}`,
+      lessons: ordered,
+    };
+  });
+}
+
+function courseShelf(shelf, index, total) {
+  const controls = layoutEditing ? `<div class="shelf-controls"><button data-shelf-move="-1" data-source="${escapeHtml(shelf.sourceId)}" ${index===0?"disabled":""}>↑ 前移</button><button data-shelf-move="1" data-source="${escapeHtml(shelf.sourceId)}" ${index===total-1?"disabled":""}>↓ 后移</button></div>` : "";
+  const title = layoutEditing
+    ? `<input class="shelf-title-input" data-shelf-title="${escapeHtml(shelf.sourceId)}" value="${escapeHtml(shelf.title)}" maxlength="80" aria-label="${escapeHtml(shelf.sourceId)} 陈列名称">`
+    : `<h3>${escapeHtml(shelf.title)}</h3>`;
+  return `<section class="course-shelf" data-source="${escapeHtml(shelf.sourceId)}"><header class="shelf-header"><div><p class="eyebrow">COURSE COLLECTION</p>${title}<p>${escapeHtml(shelf.sourceId)} · ${shelf.lessons.length} 节${shelf.sourceUrl ? ` · <a href="${escapeHtml(shelf.sourceUrl)}" target="_blank" rel="noreferrer">原视频 ↗</a>` : ""}</p></div>${controls}</header><div class="lesson-grid">${shelf.lessons.map((lesson,lessonIndex)=>adjustableLessonCard(lesson,shelf,lessonIndex)).join("")}</div></section>`;
+}
+
+function adjustableLessonCard(lesson, shelf, index) {
+  if (!layoutEditing) return lessonCard(lesson);
+  return `<div class="lesson-adjust-item">${lessonCard(lesson)}<div class="lesson-order-controls"><button data-lesson-move="-1" data-source="${escapeHtml(shelf.sourceId)}" data-lesson="${escapeHtml(lesson.id)}" ${index===0?"disabled":""}>← 前移</button><button data-lesson-move="1" data-source="${escapeHtml(shelf.sourceId)}" data-lesson="${escapeHtml(lesson.id)}" ${index===shelf.lessons.length-1?"disabled":""}>后移 →</button></div></div>`;
+}
+
+async function saveHomeLayout() {
+  homeLayout = await jsonFetch("/api/home-layout", {
+    method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(homeLayout),
+  });
+  await dashboard();
+}
+
+function bindLayoutControls(shelves) {
+  document.querySelector("#layout-toggle").onclick = async () => {
+    layoutEditing = !layoutEditing;
+    await dashboard();
+    document.querySelector(".course-display-head")?.scrollIntoView({behavior:"smooth",block:"start"});
+  };
+  document.querySelector("#layout-reset")?.addEventListener("click", async () => {
+    homeLayout = {source_order:[], lesson_order:{}, titles:{}};
+    await saveHomeLayout();
+  });
+  document.querySelectorAll("[data-shelf-move]").forEach(button => button.onclick = async () => {
+    const order = shelves.map(shelf => shelf.sourceId);
+    const index = order.indexOf(button.dataset.source);
+    const target = index + Number(button.dataset.shelfMove);
+    [order[index], order[target]] = [order[target], order[index]];
+    homeLayout.source_order = order;
+    await saveHomeLayout();
+  });
+  document.querySelectorAll("[data-lesson-move]").forEach(button => button.onclick = async () => {
+    const shelf = shelves.find(item => item.sourceId === button.dataset.source);
+    const order = shelf.lessons.map(lesson => lesson.id);
+    const index = order.indexOf(button.dataset.lesson);
+    const target = index + Number(button.dataset.lessonMove);
+    [order[index], order[target]] = [order[target], order[index]];
+    homeLayout.lesson_order[shelf.sourceId] = order;
+    await saveHomeLayout();
+  });
+  document.querySelectorAll("[data-shelf-title]").forEach(input => input.addEventListener("change", async () => {
+    const title = input.value.trim();
+    if (title) homeLayout.titles[input.dataset.shelfTitle] = title;
+    else delete homeLayout.titles[input.dataset.shelfTitle];
+    await saveHomeLayout();
+  }));
 }
 
 function lessonCard(lesson) {
@@ -143,18 +261,34 @@ function lessonCard(lesson) {
 
 function renderJobs(jobs) {
   if (!jobs.length) return `<div class="empty">提交分集后，进度会显示在这里。</div>`;
-  return jobs.map(job => `<div class="job ${job.status}"><strong>P${String(job.part).padStart(2,"0")}</strong><div class="job-copy"><span>${escapeHtml(job.stage_label || job.stage)}</span><div class="job-progress"><i style="width:${job.progress || 0}%"></i></div>${job.error ? `<span>${escapeHtml(job.error)}</span>`:""}</div><div class="job-status">${job.status === "complete" ? `<a href="${job.lesson_url}">打开课程 →</a>` : escapeHtml(job.status.toUpperCase())}</div></div>`).join("");
+  return jobs.map(job => {
+    const completeStatus = job.kind === "download" ? "已下载" : `<a href="${job.lesson_url}">打开课程 →</a>`;
+    const status = job.status === "complete" ? completeStatus : escapeHtml(job.status.toUpperCase());
+    const kind = job.kind === "download" ? `<span class="job-kind">下载 · 720p</span>` : "";
+    const profile = job.validation_profile === "phonetics_course" ? "音标课程 · OCR" : (job.validation_profile === "strict_course" ? "严格课程" : "通用视频");
+    const source = job.source_id ? `${profile} · ${job.source_id}` : profile;
+    return `<div class="job ${job.status}"><strong>P${String(job.part).padStart(2,"0")}${kind}</strong><div class="job-copy"><b class="job-source">${escapeHtml(source)}</b><span>${escapeHtml(job.stage_label || job.stage)}</span><div class="job-progress"><i style="width:${job.progress || 0}%"></i></div>${job.error ? `<span>${escapeHtml(job.error)}</span>`:""}</div><div class="job-status">${status}</div></div>`;
+  }).join("");
 }
 
 function bindJobForm() {
   const form = document.querySelector("#job-form");
+  const profile = document.querySelector("#validation-profile");
+  const pptComplete = document.querySelector("#ppt-complete");
+  const syncProfile = () => {
+    const phonetics = profile.value === "phonetics_course";
+    pptComplete.disabled = phonetics;
+    if (phonetics) pptComplete.checked = false;
+  };
+  profile.addEventListener("change", syncProfile);
+  syncProfile();
   form.addEventListener("submit", async event => {
     event.preventDefault();
     const button = form.querySelector("button");
     const message = document.querySelector("#form-message");
     button.disabled = true; message.textContent = "正在校验并创建任务…";
     try {
-      const payload={source:form.source.value,part:form.part.value ? Number(form.part.value) : null,reuse_download:document.querySelector("#reuse").checked,ppt_complete:document.querySelector("#ppt-complete").checked,strict_validation:document.querySelector("#strict-validation").checked};
+      const payload={source:form.source.value,part:form.part.value ? Number(form.part.value) : null,reuse_download:document.querySelector("#reuse").checked,ppt_complete:pptComplete.checked,validation_profile:profile.value};
       const result = await jsonFetch("/api/jobs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       if (result.confirmation_required) {
         message.textContent = `P${result.part} 已有完成课程，等待确认。`;
@@ -165,6 +299,64 @@ function bindJobForm() {
       }
     } catch (error) { message.textContent = error.message; }
     finally { button.disabled = false; }
+  });
+}
+
+function bindBatchForm() {
+  const form = document.querySelector("#batch-form");
+  const action = document.querySelector("#batch-action");
+  const courseOptions = document.querySelector("#batch-course-options");
+  const profile = document.querySelector("#batch-validation-profile");
+  const pptComplete = document.querySelector("#batch-ppt-complete");
+  const button = form.querySelector("button");
+  const updateMode = () => {
+    const courseMode = action.value === "course";
+    courseOptions.hidden = !courseMode;
+    button.textContent = courseMode ? "开始多 P 课程制作 →" : "开始批量下载 →";
+  };
+  action.addEventListener("change", updateMode);
+  profile.addEventListener("change", () => {
+    const phonetics = profile.value === "phonetics_course";
+    pptComplete.disabled = phonetics;
+    if (phonetics) pptComplete.checked = false;
+  });
+  updateMode();
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const message = document.querySelector("#batch-message");
+    const courseMode = action.value === "course";
+    button.disabled = true;
+    message.textContent = courseMode ? "正在创建多 P 课程任务…" : "正在创建批量下载任务…";
+    try {
+      const startPart = Number(form.startPart.value);
+      const endPart = Number(form.endPart.value);
+      const payload = {
+        source: form.source.value,
+        start_part: startPart,
+        end_part: endPart,
+        execution_mode: form.executionMode.value,
+        reuse_download: document.querySelector("#batch-reuse").checked,
+      };
+      if (courseMode) {
+        payload.ppt_complete = pptComplete.checked;
+        payload.validation_profile = profile.value;
+      }
+      const result = await jsonFetch(courseMode ? "/api/course-batches" : "/api/download-batches", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(payload),
+      });
+      const mode = result.execution_mode === "parallel" ? "并发" : "串行";
+      const skipped = result.skipped_parts?.length ? `；已跳过完成课程：${result.skipped_parts.map(part=>`P${part}`).join("、")}` : "";
+      message.textContent = courseMode
+        ? `P${startPart}–P${endPart} 已按${mode}模式开始制作${skipped}。`
+        : `P${startPart}–P${endPart} 已按${mode}模式开始下载，固定 720p。`;
+      setTimeout(refreshDashboardToJobs,600);
+    } catch (error) {
+      message.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
   });
 }
 
@@ -201,6 +393,7 @@ async function lessonPage(id) {
   const storageKey = `lesson-progress:${id}`;
   let completed = new Set(JSON.parse(localStorage.getItem(storageKey) || "[]"));
   let active = null, checkedQuestions = new Set(), answers = {}, modalTab = "quiz", manualOpen = false;
+  let checkpointFullscreenTarget = null;
   app.innerHTML = `<main class="shell">
     ${header(`<div class="lesson-header-actions"><a class="back-link" href="/">← 返回工坊</a><div class="series-lock"><i class="lock-dot"></i><span>P${String(lesson.part).padStart(2,"0")}</span></div></div>`)}
     <section class="lesson-layout">
@@ -285,9 +478,47 @@ async function lessonPage(id) {
     return preceding.length ? [preceding[preceding.length-1]] : [];
   }
 
+  function fullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  async function exitFullscreenForCheckpoint(openedManually) {
+    checkpointFullscreenTarget = null;
+    if (openedManually) return;
+    const target = fullscreenElement();
+    if (!target) return;
+    const exitFullscreen = document.exitFullscreen || document.webkitExitFullscreen;
+    if (!exitFullscreen) return;
+    try {
+      checkpointFullscreenTarget = target;
+      await exitFullscreen.call(document);
+    } catch (error) {
+      checkpointFullscreenTarget = null;
+      console.warn("无法在检查点自动退出全屏。", error);
+    }
+  }
+
+  function restoreFullscreenAfterCheckpoint() {
+    const target = checkpointFullscreenTarget;
+    checkpointFullscreenTarget = null;
+    if (!target || fullscreenElement()) return;
+    const connectedTarget = target.isConnected ? target : video;
+    const requestFullscreen = connectedTarget.requestFullscreen || connectedTarget.webkitRequestFullscreen;
+    if (!requestFullscreen) return;
+    try {
+      const result = requestFullscreen.call(connectedTarget);
+      if (result && typeof result.catch === "function") {
+        result.catch(error => console.warn("无法在继续播放后恢复全屏。", error));
+      }
+    } catch (error) {
+      console.warn("无法在继续播放后恢复全屏。", error);
+    }
+  }
+
   async function openQuiz(cp, openedManually=false) {
     video.pause();active=cp;manualOpen=openedManually;checkedQuestions=new Set();answers={};modalTab="quiz";
     modalRoot.innerHTML=`<div class="modal-backdrop"><section class="quiz-modal"><p>正在对齐题目与时间点笔记…</p></section></div>`;
+    await exitFullscreenForCheckpoint(openedManually);
     try { await ensureArticles(); } catch (error) { articleData=null; }
     if (active===cp) renderQuiz();
   }
@@ -300,14 +531,14 @@ async function lessonPage(id) {
     const notesHtml=!articleData?`<div class="empty">当前课程没有可读取的 Article 笔记。</div>`:`<div class="modal-note-toolbar"><span>${previousCheckpointLabel(active)} → ${formatTime(active.time)}，共 ${notes.length} 个笔记块</span><label>笔记版本<select id="modal-article-select">${articleManifest.files.map(file=>`<option value="${escapeHtml(file.name)}" ${file.name===articleData.filename?"selected":""}>${escapeHtml(file.name)} · ${kindLabels[file.kind]||file.kind}</option>`).join("")}</select></label></div><div class="modal-note-list">${notes.map((block,index)=>`<article class="modal-note-block"><div class="modal-note-meta"><button data-note-jump="${block.time}">${formatTime(block.time)}</button><span>PPT ${String(block.frame_number||index+1).padStart(2,"0")}</span><strong>${escapeHtml(block.title)}</strong></div><div class="markdown">${renderMarkdown(block.markdown)}</div></article>`).join("")||`<div class="empty">这个检查点前没有新的笔记块。</div>`}</div>`;
     modalRoot.innerHTML=`<div class="modal-backdrop"><section class="quiz-modal" role="dialog" aria-modal="true"><header class="quiz-header"><div><p class="eyebrow">${formatTime(active.time)} · KNOWLEDGE CHECK</p><h2>${escapeHtml(active.title)}</h2><p>${escapeHtml(active.summary)}</p></div><div class="quiz-header-actions"><span class="part-badge">${active.questions.length} 题</span>${manualOpen?`<button class="modal-close" id="modal-close" aria-label="关闭">×</button>`:""}</div></header><div class="modal-view-tabs"><button class="${modalTab==="quiz"?"active":""}" data-modal-tab="quiz">题目</button><button class="${modalTab==="notes"?"active":""}" data-modal-tab="notes">笔记 <span>${notes.length}</span></button></div>${modalTab==="quiz"?`<div class="question-list">${active.questions.map((q,i)=>questionHtml(q,i,results[i])).join("")}</div><footer class="quiz-footer"><div class="score">${allChecked?`<strong>${results.filter(Boolean).length}/${results.length}</strong>查看解释后继续播放。`:"完成全部题目后检查答案。"}</div><button class="primary-button" id="quiz-action" ${!allChecked&&!allAnswered?"disabled":""}>${allChecked?"继续播放 →":"检查答案"}</button></footer>`:notesHtml}</section></div>`;
     modalRoot.querySelectorAll("[data-modal-tab]").forEach(button=>button.onclick=()=>{modalTab=button.dataset.modalTab;renderQuiz()});
-    if (manualOpen) modalRoot.querySelector("#modal-close").onclick=()=>{active=null;modalRoot.innerHTML=""};
+    if (manualOpen) modalRoot.querySelector("#modal-close").onclick=()=>{checkpointFullscreenTarget=null;active=null;modalRoot.innerHTML=""};
     const articleSelect=modalRoot.querySelector("#modal-article-select");
     if(articleSelect) articleSelect.onchange=async event=>{await loadArticleFile(event.target.value);renderQuiz()};
-    modalRoot.querySelectorAll("[data-note-jump]").forEach(button=>button.onclick=()=>{video.currentTime=Number(button.dataset.noteJump);active=null;modalRoot.innerHTML="";video.play()});
+    modalRoot.querySelectorAll("[data-note-jump]").forEach(button=>button.onclick=()=>{checkpointFullscreenTarget=null;video.currentTime=Number(button.dataset.noteJump);active=null;modalRoot.innerHTML="";video.play()});
     modalRoot.querySelectorAll("input").forEach(input=>input.onchange=()=>{answers[input.dataset.qid]=input.value;renderQuiz()});
     modalRoot.querySelectorAll("[data-reset-q]").forEach(button=>button.onclick=()=>{delete answers[button.dataset.resetQ];checkedQuestions.delete(button.dataset.resetQ);renderQuiz()});
     const action=modalRoot.querySelector("#quiz-action");
-    if(action) action.onclick=()=>{ if(!allChecked){checkedQuestions=new Set(active.questions.map(q=>q.id));renderQuiz();return;} completed.add(active.id);localStorage.setItem(storageKey,JSON.stringify([...completed]));active=null;modalRoot.innerHTML="";renderCheckpoints();setTimeout(()=>video.play(),80); };
+    if(action) action.onclick=()=>{ if(!allChecked){checkedQuestions=new Set(active.questions.map(q=>q.id));renderQuiz();return;} restoreFullscreenAfterCheckpoint();completed.add(active.id);localStorage.setItem(storageKey,JSON.stringify([...completed]));active=null;modalRoot.innerHTML="";renderCheckpoints();setTimeout(()=>video.play(),80); };
   }
   function previousCheckpointLabel(cp) { const index=lesson.checkpoints.indexOf(cp); return index>0?formatTime(lesson.checkpoints[index-1].time):"课程开始"; }
   function questionHtml(q,index,isCorrect) {

@@ -20,6 +20,8 @@ import numpy as np
 from .audio_processor import AudioTranscript
 from .frame import Frame
 
+YUTTO_720P_QUALITY = "64"
+
 
 @dataclass
 class BilibiliAssets:
@@ -155,6 +157,7 @@ def _yutto_prefix() -> List[str]:
 def build_yutto_command(source: str, output_dir: Path, part: Optional[int] = None) -> List[str]:
     return _yutto_prefix() + [
         normalize_bilibili_url(source, part),
+        "--video-quality", YUTTO_720P_QUALITY,
         "--dir", str(output_dir),
         "--with-metadata",
         "--save-cover",

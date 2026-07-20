@@ -14,6 +14,27 @@
 
 严格课程校验包默认开启：它包含 PPT 页覆盖、来源数字保留、固定文章结构与标注数量等面向课程记录的规则。关闭它会保留 JSON、时间戳、题目和文件完整性校验，但不因课程专用的保真/版式规则中止任务。只有画面中有稳定 PPT 区域时才应开启“完整 PPT 记录”。
 
+首页“处理多个分集”支持“仅下载资源”和“下载并制作课程”两种模式。两种模式都可选择串行或最多 3 路并行，新下载固定为 yutto 质量代码 `64`（最高 720p），并默认复用已有视频与字幕。批量课程会跳过已有完成课程，防止未经确认重做。
+
+## 音标课程 OCR 链路
+
+选择 `phonetics_course` 时，字幕文件和 Whisper 转写都会被显式禁用，`source_manifest.json`、`transcript.json`、`record.json` 和课程 JSON 均记录 `evidence_mode: ocr_primary`。画面处理分为两条互不替代的轨道：
+
+1. 课程插图轨道按场景变化抽取并去重；
+2. 字幕 OCR 轨道每 0.25 秒扫描一次画面下部文字区，为每个不同文字状态保留一张稳定帧，逐段写入 `ocr_timeline.json`。
+
+字幕轨道不受课程插图数量限制。检测到字幕但 OCR 为空或仍有不确定字符时，任务停在 `dense_caption_ocr_validation`，保留原始分段、OCR 结果和调用日志，不会静默生成“完成”课程。
+
+本音标系列 P3–P47 的串行入口：
+
+```powershell
+..\scripts\run-phonetics-course-batch.ps1 -Source BV1iV411z7Nj -StartPart 3 -EndPart 47
+```
+
+## 唯一运行源
+
+本目录是工作区唯一规范课程服务与数据源。`GET /api/series` 必须返回 `canonical: true`，且 `canonical_root` 指向本目录。工作区顶层历史 `course-workflow/` 仅作为兼容入口，不能再启动独立数据服务或承载功能改动。
+
 ## 运行约束
 
 - 需要有效的 yutto 登录状态。

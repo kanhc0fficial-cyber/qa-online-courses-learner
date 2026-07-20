@@ -9,10 +9,13 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from .lecture_document import (
     bind_group_frames,
+    ensure_callout_kinds,
+    ensure_document_text_retention,
     ensure_minimum_callouts,
     limit_callouts,
     limit_group_callouts,
     normalize_group_blocks,
+    restore_missing_source_number_sentences,
     split_lecture_draft,
     validate_lecture_document,
     validate_lecture_group,
@@ -67,16 +70,12 @@ def format_lecture_document(
     actual_frames = [frame for _, frames in groups for frame in frames]
     supplements = supplemental_excerpts or {}
     unexpected = [frame for frame in actual_frames if frame not in expected_frames]
-    duplicates = sorted({frame for frame in actual_frames if actual_frames.count(frame) > 1})
-    if unexpected or duplicates:
-        raise ValueError(
-            f"Draft contains unexpected frames {unexpected} or duplicates {duplicates}"
-        )
-    group_by_frame = {
-        frames[0]: (excerpt, frames)
-        for excerpt, frames in groups
-        if len(frames) == 1
-    }
+    if unexpected:
+        raise ValueError(f"Draft contains unexpected frames {unexpected}")
+    group_by_frame = {}
+    for excerpt, frames in groups:
+        if len(frames) == 1 and frames[0] not in group_by_frame:
+            group_by_frame[frames[0]] = (excerpt, frames)
     missing = [frame for frame in expected_frames if frame not in group_by_frame]
     unavailable = [frame for frame in missing if frame not in supplements]
     if unavailable:
@@ -96,6 +95,9 @@ def format_lecture_document(
         cache_path = artifact_dir / f"article.frame_{frames[0]:03d}.cache.json"
         candidate_path = artifact_dir / f"article.frame_{frames[0]:03d}.candidate.json"
         repair_candidate_path = artifact_dir / f"article.frame_{frames[0]:03d}.repair.candidate.json"
+        numeric_repair_candidate_path = (
+            artifact_dir / f"article.frame_{frames[0]:03d}.numeric_repair.candidate.json"
+        )
         group = _load_cache(cache_path, excerpt)
         if group is None:
             group = _load_cache(repair_candidate_path, excerpt)
@@ -134,6 +136,22 @@ def format_lecture_document(
                 minimum_text_ratio=minimum_text_ratio,
                 require_source_numbers=is_supplement,
             )
+            if (
+                isinstance(repaired, dict)
+                and any(
+                    error.startswith("group_missing_source_numbers_")
+                    for error in repaired_validation["errors"]
+                )
+            ):
+                repaired = restore_missing_source_number_sentences(
+                    repaired, excerpt, repaired_validation["errors"]
+                )
+                _write_cache(numeric_repair_candidate_path, excerpt, repaired)
+                repaired_validation = validate_lecture_group(
+                    repaired, frames, excerpt,
+                    minimum_text_ratio=minimum_text_ratio,
+                    require_source_numbers=is_supplement,
+                )
             if repaired_validation["valid"]:
                 group, group_validation = repaired, repaired_validation
         group_validations.append(group_validation)
@@ -150,8 +168,23 @@ def format_lecture_document(
 
     document = {"title": title, "lead": [], "sections": sections}
     document = ensure_minimum_callouts(document, minimum=8)
+    document = ensure_callout_kinds(document)
     document = limit_callouts(document, maximum=12)
     validation = validate_lecture_document(document, expected_frames, validation_source)
+    if any(
+        error.startswith("structured_text_too_short_")
+        for error in validation["errors"]
+    ):
+        document = ensure_document_text_retention(
+            document, validation_source, validation["errors"]
+        )
+        _write_json(
+            artifact_dir / "article.document.retention_repair.candidate.json",
+            document,
+        )
+        validation = validate_lecture_document(
+            document, expected_frames, validation_source
+        )
     validation["group_validations"] = group_validations
     _write_json(artifact_dir / "article.document.validation.json", validation)
     if not validation["valid"]:

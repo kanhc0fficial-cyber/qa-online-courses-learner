@@ -9,9 +9,10 @@ import subprocess
 import sys
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, quote, urlparse
 
 from fastapi import FastAPI, HTTPException
@@ -30,12 +31,15 @@ from video_analyzer.bilibili import download_with_yutto
 DATA_DIR = ROOT / "data"
 LESSONS_DIR = DATA_DIR / "lessons"
 JOBS_DIR = DATA_DIR / "jobs"
+HOME_LAYOUT_PATH = DATA_DIR / "home_layout.json"
 STATIC_DIR = ROOT / "static"
 for directory in (LESSONS_DIR, JOBS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="电力电子互动课程工坊")
 job_lock = threading.Lock()
+MAX_ACTIVE_JOBS = max(1, int(os.environ.get("COURSE_MAX_ACTIVE_JOBS", "15")))
+ValidationProfile = Literal["strict_course", "general_video", "phonetics_course"]
 
 
 class JobRequest(BaseModel):
@@ -44,7 +48,33 @@ class JobRequest(BaseModel):
     reuse_download: bool = True
     force_rebuild: bool = False
     ppt_complete: bool = True
-    strict_validation: bool = True
+    strict_validation: bool | None = None
+    validation_profile: ValidationProfile | None = None
+
+
+class DownloadBatchRequest(BaseModel):
+    source: str
+    start_part: int
+    end_part: int
+    execution_mode: Literal["parallel", "serial"] = "serial"
+    reuse_download: bool = True
+
+
+class CourseBatchRequest(BaseModel):
+    source: str
+    start_part: int
+    end_part: int
+    execution_mode: Literal["parallel", "serial"] = "serial"
+    reuse_download: bool = True
+    ppt_complete: bool = True
+    strict_validation: bool | None = None
+    validation_profile: ValidationProfile | None = None
+
+
+class HomeLayoutRequest(BaseModel):
+    source_order: list[str]
+    lesson_order: dict[str, list[str]]
+    titles: dict[str, str]
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -56,6 +86,54 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def normalized_home_layout(value: dict[str, Any]) -> dict[str, Any]:
+    lessons = [read_json(path) for path in lesson_files()]
+    lesson_sources = {
+        str(lesson.get("id", "")): str(lesson.get("series_id", ""))
+        for lesson in lessons
+        if lesson.get("id") and lesson.get("series_id")
+    }
+    valid_sources = set(lesson_sources.values())
+
+    source_order = []
+    for source_id in value.get("source_order", []):
+        source_id = str(source_id)
+        if source_id in valid_sources and source_id not in source_order:
+            source_order.append(source_id)
+
+    lesson_order = {}
+    raw_lesson_order = value.get("lesson_order", {})
+    if isinstance(raw_lesson_order, dict):
+        for source_id, lesson_ids in raw_lesson_order.items():
+            source_id = str(source_id)
+            if source_id not in valid_sources or not isinstance(lesson_ids, list):
+                continue
+            ordered_ids = []
+            for lesson_id in lesson_ids:
+                lesson_id = str(lesson_id)
+                if (
+                    lesson_sources.get(lesson_id) == source_id
+                    and lesson_id not in ordered_ids
+                ):
+                    ordered_ids.append(lesson_id)
+            if ordered_ids:
+                lesson_order[source_id] = ordered_ids
+
+    titles = {}
+    raw_titles = value.get("titles", {})
+    if isinstance(raw_titles, dict):
+        for source_id, title in raw_titles.items():
+            source_id = str(source_id)
+            title = str(title).strip()
+            if source_id in valid_sources and title:
+                titles[source_id] = title[:80]
+    return {
+        "source_order": source_order,
+        "lesson_order": lesson_order,
+        "titles": titles,
+    }
 
 
 def parse_source(source: str, explicit_part: int | None = None) -> tuple[str, str, int]:
@@ -100,7 +178,9 @@ def public_lesson(lesson: dict[str, Any]) -> dict[str, Any]:
     value["url"] = f"/lessons/{lesson['id']}"
     value["video_url"] = f"/media/{lesson['id']}"
     value["subtitle_url"] = (
-        f"/subtitles/{lesson['id']}.vtt" if subtitle_path_for(lesson) else None
+        f"/subtitles/{lesson['id']}.vtt"
+        if subtitle_path_for(lesson) or transcript_path_for(lesson)
+        else None
     )
     value["article_count"] = len(article_files_for(lesson))
     return value
@@ -145,6 +225,30 @@ def subtitle_path_for(lesson: dict[str, Any]) -> Path | None:
     return None
 
 
+def transcript_path_for(lesson: dict[str, Any]) -> Path | None:
+    try:
+        record_dir = record_dir_for(lesson)
+    except HTTPException:
+        return None
+    path = record_dir / "transcript.json"
+    if not path.is_file():
+        return None
+    try:
+        value = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    segments = value.get("segments")
+    if not isinstance(segments, list):
+        return None
+    usable = any(
+        isinstance(segment, dict)
+        and str(segment.get("text", "")).strip()
+        and segment.get("start") is not None
+        for segment in segments
+    )
+    return path if usable else None
+
+
 def srt_to_vtt(source: str) -> str:
     normalized = source.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
     cues = []
@@ -163,6 +267,34 @@ def srt_to_vtt(source: str) -> str:
             cues.append(timestamp + "\n" + "\n".join(text_lines))
     if not cues:
         raise ValueError("字幕文件中没有有效时间轴")
+    return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
+
+
+def vtt_timestamp(seconds: float) -> str:
+    milliseconds = max(0, round(float(seconds) * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+
+
+def transcript_to_vtt(transcript: dict[str, Any]) -> str:
+    cues = []
+    for segment in transcript.get("segments", []):
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text", "")).strip()
+        if not text or segment.get("start") is None:
+            continue
+        start = max(0.0, float(segment["start"]))
+        end = float(segment.get("end", start + 2.0))
+        if end <= start:
+            end = start + 0.5
+        cues.append(
+            f"{vtt_timestamp(start)} --> {vtt_timestamp(end)}\n{text}"
+        )
+    if not cues:
+        raise ValueError("transcript.json 中没有可用的时间轴片段")
     return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
 
 
@@ -294,12 +426,49 @@ def find_existing_lesson(source_id: str, part: int) -> dict[str, Any] | None:
     return None
 
 
-def find_download(source_id: str, part: int) -> Path | None:
+def resolve_validation_profile(
+    validation_profile: ValidationProfile | None,
+    strict_validation: bool | None,
+) -> ValidationProfile:
+    """Keep old API clients working while making new workflows explicit."""
+    if validation_profile is not None:
+        return validation_profile
+    return "general_video" if strict_validation is False else "strict_course"
+
+
+def visible_jobs(
+    jobs: list[dict[str, Any]],
+    lessons: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide historical failures once the same series part has a completed lesson."""
+    completed_parts = {
+        (str(lesson.get("series_id", "")), int(lesson.get("part", -1)))
+        for lesson in lessons
+        if lesson.get("series_id") and lesson.get("part") is not None
+    }
+    return [
+        job for job in jobs
+        if not (
+            job.get("status") == "failed"
+            and (str(job.get("source_id", "")), int(job.get("part", -1)))
+            in completed_parts
+        )
+    ]
+
+
+def find_download(
+    source_id: str,
+    part: int,
+    *,
+    require_subtitle: bool = False,
+) -> Path | None:
     pattern = re.compile(rf"{re.escape(source_id)}-p0*{part}(?:\D|$)", re.I)
     candidates = []
     for directory in (PROJECT_ROOT / "downloads").glob("*"):
         if directory.is_dir() and pattern.search(directory.name):
-            if list(directory.rglob("*.mp4")) and list(directory.rglob("*.srt")):
+            has_video = bool(list(directory.rglob("*.mp4")))
+            has_subtitle = bool(list(directory.rglob("*.srt")))
+            if has_video and (has_subtitle or not require_subtitle):
                 candidates.append(directory)
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
@@ -315,11 +484,13 @@ def update_job(job_id: str, **changes: Any) -> dict[str, Any]:
 
 
 def run_job(job_id: str, source_url: str, source_id: str, part: int, reuse_download: bool,
-            ppt_complete: bool, strict_validation: bool) -> None:
+            ppt_complete: bool, validation_profile: ValidationProfile,
+            resume_record_dir: str | None = None) -> None:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     try:
         if not os.environ.get("XIAOMI_MIMO_API_KEY_TEM1") or not os.environ.get("XIAOMI_MIMO_BASE_URL"):
             raise RuntimeError("缺少 MiMo 环境变量，任务未开始下载")
+        ocr_primary = validation_profile == "phonetics_course"
         source_dir = find_download(source_id, part) if reuse_download else None
         if source_dir:
             update_job(job_id, stage="download", stage_label="复用已下载视频与字幕", progress=18,
@@ -330,10 +501,23 @@ def run_job(job_id: str, source_url: str, source_id: str, part: int, reuse_downl
                        download_dir=str(source_dir))
             download_with_yutto(source_url, source_dir, part)
 
-        mode = "ppt_complete" if ppt_complete else "general"
-        record_dir = PROJECT_ROOT / "records" / f"{source_id}-p{part:02d}_{mode}_mimo-v2.5_tem1_{timestamp}"
+        mode = (
+            "phonetics_ocr"
+            if ocr_primary
+            else ("ppt_complete" if ppt_complete else "general")
+        )
+        record_dir = (
+            Path(resume_record_dir).resolve()
+            if resume_record_dir
+            else PROJECT_ROOT / "records" / f"{source_id}-p{part:02d}_{mode}_mimo-v2.5_tem1_{timestamp}"
+        )
         log_path = JOBS_DIR / f"{job_id}.workflow.log"
-        update_job(job_id, stage="analysis", stage_label="识别 PPT、理解字幕并生成教案", progress=28,
+        analysis_label = (
+            "密集抽帧并以 OCR 识别音标、中英文字与例词"
+            if ocr_primary
+            else "识别 PPT、理解字幕并生成教案"
+        )
+        update_job(job_id, stage="analysis", stage_label=analysis_label, progress=28,
                    record_dir=str(record_dir), log_path=str(log_path))
         command = [
             sys.executable,
@@ -343,13 +527,19 @@ def run_job(job_id: str, source_url: str, source_id: str, part: int, reuse_downl
             "--output", str(record_dir),
             "--model", "mimo-v2.5",
             "--api-key-env", "XIAOMI_MIMO_API_KEY_TEM1",
-            "--validation-profile", "strict_course" if strict_validation else "general_video",
+            "--validation-profile", validation_profile,
         ]
-        if ppt_complete:
+        if ppt_complete and not ocr_primary:
             command += ["--ppt-complete", "--ppt-ignore-head", "18", "--ppt-ignore-tail", "10"]
+        if resume_record_dir:
+            command.append("--resume")
         environment = dict(os.environ)
         environment["PYTHONUTF8"] = "1"
         environment["PYTHONIOENCODING"] = "utf-8"
+        environment.setdefault("WHISPER_MODEL", "medium")
+        environment.setdefault("WHISPER_BACKEND", "openai")
+        environment.setdefault("HF_HUB_DISABLE_XET", "1")
+        environment.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         with log_path.open("w", encoding="utf-8") as log:
             subprocess.run(
                 command,
@@ -362,9 +552,15 @@ def run_job(job_id: str, source_url: str, source_id: str, part: int, reuse_downl
                 check=True,
             )
 
-        update_job(job_id, stage="quiz", stage_label="生成题目并定位老师讲完的时间", progress=82)
+        quiz_label = (
+            "依据 OCR 场景时间线生成音标练习"
+            if ocr_primary
+            else "生成题目并定位老师讲完的时间"
+        )
+        update_job(job_id, stage="quiz", stage_label=quiz_label, progress=82)
         lesson_path = build_lesson(record_dir, job_id, part, source_url,
-                                   source_id=source_id, strict_validation=strict_validation)
+                                   source_id=source_id,
+                                   validation_profile=validation_profile)
         lesson = read_json(lesson_path)
         update_job(job_id, status="complete", stage="complete", stage_label="课程网址已就绪",
                    progress=100, lesson_id=lesson["id"], lesson_url=f"/lessons/{lesson['id']}")
@@ -375,12 +571,100 @@ def run_job(job_id: str, source_url: str, source_id: str, part: int, reuse_downl
                    error=str(exc), error_log=str(error_path))
 
 
+def run_download_job(job_id: str, source_url: str, source_id: str, part: int,
+                     reuse_download: bool) -> None:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        source_dir = find_download(source_id, part) if reuse_download else None
+        if source_dir:
+            update_job(
+                job_id,
+                status="complete",
+                stage="complete",
+                stage_label="已复用现有 720p 视频与字幕",
+                progress=100,
+                download_dir=str(source_dir),
+            )
+            return
+        source_dir = PROJECT_ROOT / "downloads" / f"{source_id}-p{part:02d}_{timestamp}"
+        update_job(
+            job_id,
+            status="running",
+            stage="download",
+            stage_label="正在下载 720p 视频、字幕和元数据",
+            progress=12,
+            download_dir=str(source_dir),
+        )
+        download_with_yutto(source_url, source_dir, part)
+        update_job(
+            job_id,
+            status="complete",
+            stage="complete",
+            stage_label="720p 下载完成",
+            progress=100,
+        )
+    except Exception as exc:
+        error_path = JOBS_DIR / f"{job_id}.error.log"
+        error_path.write_text(traceback.format_exc(), encoding="utf-8")
+        update_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            stage_label="下载已停止",
+            error=str(exc),
+            error_log=str(error_path),
+        )
+
+
+def run_download_batch(items: list[tuple[str, str, str, int, bool]],
+                       execution_mode: str) -> None:
+    if execution_mode == "parallel":
+        with ThreadPoolExecutor(max_workers=min(3, len(items)), thread_name_prefix="download") as pool:
+            list(pool.map(lambda item: run_download_job(*item), items))
+        return
+    for item in items:
+        run_download_job(*item)
+
+
+def run_course_batch(items: list[tuple[str, str, str, int, bool, bool, ValidationProfile]],
+                     execution_mode: str) -> None:
+    if execution_mode == "parallel":
+        with ThreadPoolExecutor(max_workers=min(3, len(items)), thread_name_prefix="course") as pool:
+            list(pool.map(lambda item: run_job(*item), items))
+        return
+    for item in items:
+        run_job(*item)
+
+
+def validate_part_range(start_part: int, end_part: int) -> list[int]:
+    if not 1 <= start_part <= 999 or not 1 <= end_part <= 999:
+        raise HTTPException(400, "分集必须在 1 到 999 之间")
+    if start_part > end_part:
+        raise HTTPException(400, "起始 P 不能大于结束 P")
+    parts = list(range(start_part, end_part + 1))
+    if len(parts) > 30:
+        raise HTTPException(400, "一次最多处理 30 个分集")
+    return parts
+
+
 @app.get("/api/series")
 def get_series() -> dict[str, Any]:
-    lessons = [public_lesson(read_json(path)) for path in lesson_files()]
-    jobs = [read_json(path) for path in sorted(JOBS_DIR.glob("*.json"), reverse=True)[:20]]
+    lesson_values = [read_json(path) for path in lesson_files()]
+    lessons = [public_lesson(lesson) for lesson in lesson_values]
+    job_values = [
+        read_json(path)
+        for path in JOBS_DIR.glob("*.json")
+    ]
+    jobs = sorted(
+        visible_jobs(job_values, lesson_values),
+        key=lambda job: str(job.get("updated_at", job.get("created_at", ""))),
+        reverse=True,
+    )[:20]
     return {
         "title": "互动课程工坊",
+        "canonical": True,
+        "canonical_root": str(ROOT.resolve()),
+        "data_dir": str(DATA_DIR.resolve()),
         "lessons": lessons,
         "jobs": jobs,
     }
@@ -408,9 +692,26 @@ def create_job(request: JobRequest) -> dict[str, Any]:
         job = read_json(path)
         if job.get("status") in {"queued", "running"}:
             active_jobs.append(job)
-    if active_jobs:
+    duplicate = next(
+        (
+            job for job in active_jobs
+            if job.get("source_id") == source_id and int(job.get("part", -1)) == part
+        ),
+        None,
+    )
+    if duplicate:
+        raise HTTPException(409, f"P{part} 已在制造中，不能重复提交")
+    if len(active_jobs) >= MAX_ACTIVE_JOBS:
         active = max(active_jobs, key=lambda job: str(job.get("updated_at", "")))
-        raise HTTPException(409, f"当前正在制作 P{active.get('part')}，完成后才能提交下一集")
+        raise HTTPException(
+            409,
+            f"并发制造已达到上限 {MAX_ACTIVE_JOBS}；"
+            f"P{active.get('part')} 等任务完成后才能继续提交",
+        )
+    validation_profile = resolve_validation_profile(
+        request.validation_profile,
+        request.strict_validation,
+    )
     job_id = f"p{part:02d}-{datetime.now():%Y%m%d-%H%M%S}"
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     job = {
@@ -421,8 +722,9 @@ def create_job(request: JobRequest) -> dict[str, Any]:
         "progress": 2,
         "part": part,
         "source_id": source_id,
-        "ppt_complete": request.ppt_complete,
-        "validation_profile": "strict_course" if request.strict_validation else "general_video",
+        "ppt_complete": request.ppt_complete and validation_profile != "phonetics_course",
+        "validation_profile": validation_profile,
+        "evidence_mode": "ocr_primary" if validation_profile == "phonetics_course" else "audio_visual",
         "source_url": source_url,
         "created_at": now,
         "updated_at": now,
@@ -431,12 +733,171 @@ def create_job(request: JobRequest) -> dict[str, Any]:
     thread = threading.Thread(
         target=run_job,
         args=(job_id, source_url, source_id, part, request.reuse_download,
-              request.ppt_complete, request.strict_validation),
+              request.ppt_complete, validation_profile),
         daemon=True,
         name=f"lesson-{job_id}",
     )
     thread.start()
     return job
+
+
+@app.post("/api/download-batches")
+def create_download_batch(request: DownloadBatchRequest) -> dict[str, Any]:
+    parts = validate_part_range(request.start_part, request.end_part)
+    try:
+        _, source_id, _ = parse_source(request.source, request.start_part)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    active_parts = {
+        int(job["part"])
+        for path in JOBS_DIR.glob("*.json")
+        if (job := read_json(path)).get("kind") == "download"
+        and job.get("source_id") == source_id
+        and job.get("status") in {"queued", "running"}
+    }
+    duplicates = sorted(active_parts.intersection(parts))
+    if duplicates:
+        raise HTTPException(
+            409,
+            f"{'、'.join(f'P{part}' for part in duplicates)} 已有下载任务正在运行",
+        )
+
+    batch_id = f"download-{datetime.now():%Y%m%d-%H%M%S-%f}"
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    jobs = []
+    items = []
+    for part in parts:
+        source_url, _, _ = parse_source(request.source, part)
+        job_id = f"{batch_id}-p{part:03d}"
+        job = {
+            "id": job_id,
+            "batch_id": batch_id,
+            "kind": "download",
+            "status": "queued",
+            "stage": "queued",
+            "stage_label": "等待下载（固定 720p）",
+            "progress": 2,
+            "part": part,
+            "source_id": source_id,
+            "source_url": source_url,
+            "execution_mode": request.execution_mode,
+            "quality": "720p",
+            "created_at": now,
+            "updated_at": now,
+        }
+        write_json_atomic(JOBS_DIR / f"{job_id}.json", job)
+        jobs.append(job)
+        items.append((job_id, source_url, source_id, part, request.reuse_download))
+    threading.Thread(
+        target=run_download_batch,
+        args=(items, request.execution_mode),
+        daemon=True,
+        name=batch_id,
+    ).start()
+    return {
+        "batch_id": batch_id,
+        "status": "running",
+        "execution_mode": request.execution_mode,
+        "quality": "720p",
+        "parts": parts,
+        "jobs": jobs,
+    }
+
+
+@app.post("/api/course-batches")
+def create_course_batch(request: CourseBatchRequest) -> dict[str, Any]:
+    parts = validate_part_range(request.start_part, request.end_part)
+    try:
+        _, source_id, _ = parse_source(request.source, request.start_part)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    active_parts = {
+        int(job["part"])
+        for path in JOBS_DIR.glob("*.json")
+        if (job := read_json(path)).get("source_id") == source_id
+        and job.get("status") in {"queued", "running"}
+    }
+    duplicates = sorted(active_parts.intersection(parts))
+    if duplicates:
+        raise HTTPException(
+            409,
+            f"{'、'.join(f'P{part}' for part in duplicates)} 已有任务正在运行",
+        )
+
+    validation_profile = resolve_validation_profile(
+        request.validation_profile,
+        request.strict_validation,
+    )
+    skipped_parts = [
+        part for part in parts
+        if find_existing_lesson(source_id, part) is not None
+    ]
+    pending_parts = [part for part in parts if part not in skipped_parts]
+    batch_id = f"course-{datetime.now():%Y%m%d-%H%M%S-%f}"
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    jobs = []
+    items = []
+    for part in pending_parts:
+        source_url, _, _ = parse_source(request.source, part)
+        job_id = f"{batch_id}-p{part:03d}"
+        job = {
+            "id": job_id,
+            "batch_id": batch_id,
+            "kind": "lesson",
+            "status": "queued",
+            "stage": "queued",
+            "stage_label": "等待批量课程制作",
+            "progress": 2,
+            "part": part,
+            "source_id": source_id,
+            "source_url": source_url,
+            "execution_mode": request.execution_mode,
+            "ppt_complete": request.ppt_complete and validation_profile != "phonetics_course",
+            "validation_profile": validation_profile,
+            "evidence_mode": "ocr_primary" if validation_profile == "phonetics_course" else "audio_visual",
+            "created_at": now,
+            "updated_at": now,
+        }
+        write_json_atomic(JOBS_DIR / f"{job_id}.json", job)
+        jobs.append(job)
+        items.append((
+            job_id,
+            source_url,
+            source_id,
+            part,
+            request.reuse_download,
+            request.ppt_complete,
+            validation_profile,
+        ))
+    if items:
+        threading.Thread(
+            target=run_course_batch,
+            args=(items, request.execution_mode),
+            daemon=True,
+            name=batch_id,
+        ).start()
+    return {
+        "batch_id": batch_id,
+        "status": "running" if items else "complete",
+        "execution_mode": request.execution_mode,
+        "parts": pending_parts,
+        "skipped_parts": skipped_parts,
+        "jobs": jobs,
+    }
+
+
+@app.get("/api/home-layout")
+def get_home_layout() -> dict[str, Any]:
+    if not HOME_LAYOUT_PATH.is_file():
+        return normalized_home_layout({})
+    return normalized_home_layout(read_json(HOME_LAYOUT_PATH))
+
+
+@app.put("/api/home-layout")
+def update_home_layout(request: HomeLayoutRequest) -> dict[str, Any]:
+    layout = normalized_home_layout(request.model_dump())
+    write_json_atomic(HOME_LAYOUT_PATH, layout)
+    return layout
 
 
 @app.get("/api/jobs/{job_id}")
@@ -505,14 +966,27 @@ def get_media(lesson_id: str) -> FileResponse:
 def get_subtitles(lesson_id: str) -> Response:
     lesson = load_lesson(lesson_id)
     path = subtitle_path_for(lesson)
-    if not path:
-        raise HTTPException(404, "中文字幕不存在")
-    text = path.read_text(encoding="utf-8-sig")
-    if path.suffix.lower() == ".srt":
-        text = srt_to_vtt(text)
-    elif not text.lstrip().startswith("WEBVTT"):
-        text = "WEBVTT\n\n" + text
-    return Response(content=text, media_type="text/vtt; charset=utf-8", headers={"Cache-Control": "no-cache"})
+    source = "downloaded_subtitle"
+    if path:
+        text = path.read_text(encoding="utf-8-sig")
+        if path.suffix.lower() == ".srt":
+            text = srt_to_vtt(text)
+        elif not text.lstrip().startswith("WEBVTT"):
+            text = "WEBVTT\n\n" + text
+    else:
+        transcript_path = transcript_path_for(lesson)
+        if not transcript_path:
+            raise HTTPException(404, "字幕和本地转写均不存在")
+        text = transcript_to_vtt(read_json(transcript_path))
+        source = "generated_from_transcript"
+    return Response(
+        content=text,
+        media_type="text/vtt; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Subtitle-Source": source,
+        },
+    )
 
 
 @app.get("/static/{asset_path:path}")

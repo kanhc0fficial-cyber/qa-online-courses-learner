@@ -304,6 +304,109 @@ class VideoProcessor:
         )
         return self.frames
 
+    def extract_dense_ocr_segments(
+        self,
+        output_dir: Path,
+        *,
+        sample_interval: float = 0.25,
+        caption_bounds: Tuple[float, float, float, float] = (0.0, 0.68, 1.0, 0.98),
+        changed_pixel_ratio: float = 0.002,
+        pixel_threshold: int = 18,
+        minimum_segment_seconds: float = 0.20,
+    ) -> Tuple[List[Frame], List[dict]]:
+        """Preserve every distinct burned-in caption state on a dense timeline.
+
+        This track is intentionally independent from article/keyframe selection.
+        It samples at 4 Hz by default, segments changes inside the caption ROI,
+        and saves the sharpest crop from every segment for OCR.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cap = cv2.VideoCapture(str(self.video_path))
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video file: {self.video_path}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if fps <= 0 or total_frames <= 0:
+            cap.release()
+            raise ValueError(f"Video has invalid FPS or frame count: {self.video_path}")
+
+        duration = total_frames / fps
+        timestamps = np.arange(0.0, duration, max(sample_interval, 1.0 / fps))
+        runs: List[dict] = []
+        current: Optional[dict] = None
+        reference: Optional[np.ndarray] = None
+        for timestamp in timestamps:
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
+            ok, image = cap.read()
+            if not ok or image is None:
+                continue
+            crop = self._normalized_crop(image, caption_bounds)
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            signature = cv2.GaussianBlur(gray, (3, 3), 0)
+            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            changed = False
+            change_ratio = 0.0
+            if reference is not None:
+                difference = cv2.absdiff(reference, signature)
+                change_ratio = float(np.mean(difference >= pixel_threshold))
+                changed = change_ratio >= changed_pixel_ratio
+            if current is None or changed:
+                if current is not None:
+                    current["end"] = float(timestamp)
+                    runs.append(current)
+                current = {
+                    "start": float(timestamp),
+                    "end": min(duration, float(timestamp) + sample_interval),
+                    "best_image": crop.copy(),
+                    "best_timestamp": float(timestamp),
+                    "sharpness": sharpness,
+                    "change_ratio": change_ratio,
+                }
+                reference = signature
+            else:
+                current["end"] = min(duration, float(timestamp) + sample_interval)
+                if sharpness > float(current["sharpness"]):
+                    current["best_image"] = crop.copy()
+                    current["best_timestamp"] = float(timestamp)
+                    current["sharpness"] = sharpness
+        cap.release()
+        if current is not None:
+            current["end"] = duration
+            runs.append(current)
+        if not runs:
+            raise ValueError("No dense OCR samples could be extracted from the video")
+
+        frames: List[Frame] = []
+        timeline: List[dict] = []
+        for index, run in enumerate(runs, start=1):
+            end = max(float(run["end"]), float(run["start"]) + minimum_segment_seconds)
+            path = output_dir / f"caption_{index:04d}.jpg"
+            enlarged = cv2.resize(
+                run["best_image"],
+                None,
+                fx=2.0,
+                fy=2.0,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            if not cv2.imwrite(str(path), enlarged):
+                raise OSError(f"Could not write dense OCR frame: {path}")
+            frames.append(Frame(
+                number=index,
+                path=path,
+                timestamp=float(run["best_timestamp"]),
+                score=float(run["change_ratio"]),
+                source="dense_caption_ocr",
+            ))
+            timeline.append({
+                "segment": index,
+                "start": round(float(run["start"]), 3),
+                "end": round(min(duration, end), 3),
+                "sample_timestamp": round(float(run["best_timestamp"]), 3),
+                "frame_path": str(path),
+                "change_ratio": round(float(run["change_ratio"]), 6),
+            })
+        return frames, timeline
+
     @staticmethod
     def _normalized_crop(image: np.ndarray, bounds: Tuple[float, float, float, float]) -> np.ndarray:
         height, width = image.shape[:2]

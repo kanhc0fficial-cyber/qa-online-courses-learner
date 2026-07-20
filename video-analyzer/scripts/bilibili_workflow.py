@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -144,7 +145,10 @@ def main() -> None:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--model", default="mimo-v2.5")
-    parser.add_argument("--whisper-model", default="medium")
+    parser.add_argument(
+        "--whisper-model",
+        default=os.environ.get("WHISPER_MODEL", "medium"),
+    )
     parser.add_argument("--api-key-env", default="XIAOMI_MIMO_API_KEY")
     parser.add_argument("--base-url-env", default="XIAOMI_MIMO_BASE_URL")
     parser.add_argument("--ppt-complete", action="store_true",
@@ -153,8 +157,12 @@ def main() -> None:
     parser.add_argument("--ppt-ignore-tail", type=float, default=0.0)
     parser.add_argument("--resume", action="store_true",
                         help="Reuse validated frames, scenes, and draft artifacts from --output")
-    parser.add_argument("--validation-profile", choices=("strict_course", "general_video"),
-                        default="strict_course", help="课程来源保真规则包；general_video 保留通用运行校验")
+    parser.add_argument(
+        "--validation-profile",
+        choices=("strict_course", "general_video", "phonetics_course"),
+        default="strict_course",
+        help="规则包；phonetics_course 强制以画面 OCR 为唯一事实源",
+    )
     args = parser.parse_args()
 
     source_path = Path(args.source).expanduser()
@@ -165,7 +173,11 @@ def main() -> None:
         download_with_yutto(args.source, source_dir, args.part)
 
     assets = discover_bilibili_assets(source_dir)
-    mode_name = "ppt_complete" if args.ppt_complete else "minimal"
+    mode_name = (
+        "phonetics_ocr"
+        if args.validation_profile == "phonetics_course"
+        else ("ppt_complete" if args.ppt_complete else "minimal")
+    )
     output = (args.output or (ROOT.parent / "records" / f"{assets.video.stem}_bilibili_{mode_name}_{datetime.now():%Y%m%dT%H%M%S}")).resolve()
     output.mkdir(parents=True, exist_ok=True)
     duration = duration_of(assets.video)
@@ -173,19 +185,31 @@ def main() -> None:
     transcript = None
     subtitle_info = {"usable": False}
     transcript_source = "none"
-    if assets.subtitle and assets.subtitle.suffix.lower() == ".srt":
+    ocr_primary = args.validation_profile == "phonetics_course"
+    if ocr_primary:
+        subtitle_info = {
+            "usable": False,
+            "ignored": True,
+            "reason": "phonetics_course_ocr_primary",
+        }
+        transcript_source = "disabled_ocr_primary"
+    elif assets.subtitle and assets.subtitle.suffix.lower() == ".srt":
         candidate = parse_srt(assets.subtitle)
         subtitle_info = subtitle_quality(candidate, duration)
         if subtitle_info["usable"]:
             transcript, transcript_source = candidate, "downloaded_srt"
-    if transcript is None:
+    if transcript is None and not ocr_primary:
         processor = AudioProcessor(language=None, model_size_or_path=args.whisper_model, device="cpu")
         audio = processor.extract_audio(assets.video, output)
         if not audio or not (transcript := processor.transcribe(audio)):
             raise RuntimeError("字幕不可用，且本地 Whisper 转写失败")
         transcript_source = f"local_whisper_{args.whisper_model}"
 
-    frame_budget = args.max_frames or recommended_bilibili_frame_count(duration)
+    frame_budget = args.max_frames or (
+        min(60, max(24, math.ceil(duration / 60.0 * 8)))
+        if ocr_primary
+        else recommended_bilibili_frame_count(duration)
+    )
     frame_processor = VideoProcessor(assets.video, output / "assets" / "frames", args.model)
     frames_path = output / "frames.json"
     if args.resume and frames_path.exists():
@@ -199,51 +223,111 @@ def main() -> None:
         ) for row in frame_rows]
         if not frames or not all(frame.path.exists() for frame in frames):
             raise RuntimeError("--resume frames.json references missing frame files")
-        frame_budget = None if args.ppt_complete else len(frames)
-    elif args.ppt_complete:
+        frame_budget = None if args.ppt_complete and not ocr_primary else len(frames)
+    elif args.ppt_complete and not ocr_primary:
         frames = frame_processor.extract_ppt_slides(
             ignore_head_seconds=args.ppt_ignore_head,
             ignore_tail_seconds=args.ppt_ignore_tail,
         )
         frame_budget = None
+    elif ocr_primary:
+        frames = frame_processor.extract_keyframes(
+            frames_per_minute=8,
+            max_frames=frame_budget,
+            scene_threshold=0.08,
+            hash_distance=2,
+            detect_scenes=True,
+        )
     else:
         frames = frame_processor.extract_keyframes(
             frames_per_minute=1, max_frames=frame_budget, scene_threshold=0.16,
             detect_scenes=False,
         )
+    ocr_frames = []
+    raw_ocr_timeline = []
+    if ocr_primary:
+        raw_timeline_path = output / "ocr_timeline.raw.json"
+        if args.resume and raw_timeline_path.is_file():
+            raw_ocr_timeline = json.loads(
+                raw_timeline_path.read_text(encoding="utf-8")
+            )
+            ocr_frames = [
+                Frame(
+                    number=int(item["segment"]),
+                    path=Path(str(item["frame_path"])),
+                    timestamp=float(item["sample_timestamp"]),
+                    score=float(item.get("change_ratio", 0.0)),
+                    source="resumed_dense_caption_ocr",
+                )
+                for item in raw_ocr_timeline
+            ]
+            if not ocr_frames or not all(frame.path.is_file() for frame in ocr_frames):
+                raise RuntimeError(
+                    "--resume ocr_timeline.raw.json references missing OCR frames"
+                )
+        else:
+            ocr_frames, raw_ocr_timeline = frame_processor.extract_dense_ocr_segments(
+                output / "assets" / "ocr_captions",
+                sample_interval=0.25,
+            )
     metadata = parse_nfo(assets.metadata)
     manifest = {
-        "workflow": "bilibili_ppt_complete_v1" if args.ppt_complete else "bilibili_token_minimal_v1",
+        "workflow": (
+            "bilibili_phonetics_ocr_v1"
+            if ocr_primary
+            else ("bilibili_ppt_complete_v1" if args.ppt_complete else "bilibili_token_minimal_v1")
+        ),
         "validation_profile": args.validation_profile,
+        "evidence_mode": "ocr_primary" if ocr_primary else "audio_visual",
         "video": str(assets.video), "duration": duration,
-        "subtitle": str(assets.subtitle) if assets.subtitle else None,
+        "subtitle": None if ocr_primary else (str(assets.subtitle) if assets.subtitle else None),
+        "ignored_subtitle": str(assets.subtitle) if ocr_primary and assets.subtitle else None,
         "subtitle_quality": subtitle_info, "transcript_source": transcript_source,
         "metadata": metadata,
         "danmaku": {"path": str(assets.danmaku) if assets.danmaku else None,
                     "role": "audience_commentary", "used_for_facts": False},
         "cover": str(assets.cover) if assets.cover else None,
         "frame_budget": frame_budget, "extracted_frames": len(frames),
+        "ocr_sampling": ({
+            "sample_interval_seconds": 0.25,
+            "frames_per_minute": 8,
+            "scene_threshold": 0.08,
+            "hash_distance": 2,
+            "max_frames": frame_budget,
+            "fact_source": "frame_ocr_only",
+            "dense_caption_segments": len(ocr_frames),
+            "coverage_policy": "every_detected_caption_state_must_have_an_ocr_result",
+        } if ocr_primary else None),
         "ppt_detection": ({
             "detector_bounds": [0.035, 0.075, 0.60, 0.78],
             "content_bounds": [0.02, 0.055, 0.73, 0.79],
             "ignore_head_seconds": args.ppt_ignore_head,
             "ignore_tail_seconds": args.ppt_ignore_tail,
             "scene_scope": "fixed_ppt_region_only",
-        } if args.ppt_complete else None),
-        "token_policy": {"visual_calls": "ceil(frames/4)" if args.ppt_complete else "ceil(frames/6)", "article_calls": 1,
+        } if args.ppt_complete and not ocr_primary else None),
+        "token_policy": {"visual_calls": "ceil(frames/4)" if args.ppt_complete or ocr_primary else "ceil(frames/6)", "article_calls": 1,
                          "fact_check_call": False, "automatic_retry": False},
     }
     write_json(output / "source_manifest.json", manifest)
     write_json(output / "transcript.json", {
-        "text": transcript.text, "segments": transcript.segments, "language": transcript.language,
+        "text": transcript.text if transcript else "",
+        "segments": transcript.segments if transcript else [],
+        "language": transcript.language if transcript else None,
         "source": transcript_source,
+        "used_for_facts": not ocr_primary,
     })
     write_json(output / "frames.json", [{
         "number": f.number, "path": f.path.relative_to(output).as_posix(),
         "timestamp": f.timestamp, "score": f.score, "source": f.source,
     } for f in frames])
+    if ocr_primary:
+        write_json(output / "ocr_timeline.raw.json", raw_ocr_timeline)
     if args.prepare_only:
-        write_json(output / "run_state.json", {"status": "prepared", "next": "MiMo visual grounding"})
+        write_json(output / "run_state.json", {
+            "status": "prepared",
+            "next": "MiMo visual grounding",
+            "dense_ocr_segments": len(ocr_frames),
+        })
         print(output)
         return
 
@@ -269,6 +353,62 @@ def main() -> None:
     def combined_call_log():
         return prior_call_log + analyzer.call_log
 
+    ocr_timeline = []
+    if ocr_primary:
+        completed_timeline_path = output / "ocr_timeline.json"
+        if args.resume and completed_timeline_path.is_file():
+            saved_timeline = json.loads(
+                completed_timeline_path.read_text(encoding="utf-8")
+            )
+            if isinstance(saved_timeline, list):
+                ocr_timeline = saved_timeline
+        if len(ocr_timeline) > len(ocr_frames):
+            raise RuntimeError("--resume OCR timeline has more results than raw segments")
+        for start in range(len(ocr_timeline), len(ocr_frames), 4):
+            frame_group = ocr_frames[start:start + 4]
+            try:
+                results = analyzer.analyze_phonetics_caption_group(frame_group)
+            except Exception as exc:
+                write_json(output / "ocr_timeline.json", ocr_timeline)
+                write_json(output / "api_calls.json", combined_call_log())
+                write_json(output / "run_state.json", {
+                    "status": "failed",
+                    "stage": "dense_caption_ocr",
+                    "error": str(exc),
+                    "completed_segments": len(ocr_timeline),
+                    "expected_segments": len(ocr_frames),
+                    "policy": "stopped_after_first_model_error",
+                })
+                raise
+            for raw, result in zip(raw_ocr_timeline[start:start + 4], results):
+                item = {**raw, **result}
+                ocr_timeline.append(item)
+            write_json(output / "ocr_timeline.json", ocr_timeline)
+            write_json(output / "api_calls.json", combined_call_log())
+
+        unresolved = [
+            item for item in ocr_timeline
+            if item.get("has_caption")
+            and (
+                not str(item.get("caption_text", "")).strip()
+                or item.get("uncertainties")
+            )
+        ]
+        if len(ocr_timeline) != len(raw_ocr_timeline) or unresolved:
+            write_json(output / "run_state.json", {
+                "status": "failed",
+                "stage": "dense_caption_ocr_validation",
+                "expected_segments": len(raw_ocr_timeline),
+                "actual_segments": len(ocr_timeline),
+                "unresolved_segments": [
+                    int(item.get("segment", -1)) for item in unresolved
+                ],
+                "policy": "no_silent_caption_omissions",
+            })
+            raise RuntimeError(
+                "音标课程字幕 OCR 覆盖不完整；未确认时间段已保留在 ocr_timeline.json"
+            )
+
     scenes = []
     cached_scenes = {}
     if args.resume and record_path.exists():
@@ -278,19 +418,24 @@ def main() -> None:
             for scene in cached_record.get("scenes", [])
             if isinstance(scene, dict) and "frame_number" in scene
         }
-    group_size = 4 if args.ppt_complete else 6
+    group_size = 4 if args.ppt_complete or ocr_primary else 6
     for start in range(0, len(frames), group_size):
         frame_group = frames[start:start + group_size]
         if all(frame.number in cached_scenes for frame in frame_group):
             batch = [cached_scenes[frame.number] for frame in frame_group]
         else:
-            batch = (
-                analyzer.analyze_lecture_slide_group(frame_group, transcript)
-                if args.ppt_complete
-                else analyzer.analyze_bilibili_frame_group(frame_group, transcript)
-            )
+            if ocr_primary:
+                batch = analyzer.analyze_phonetics_frame_group(frame_group)
+            elif args.ppt_complete:
+                batch = analyzer.analyze_lecture_slide_group(frame_group, transcript)
+            else:
+                batch = analyzer.analyze_bilibili_frame_group(frame_group, transcript)
         failed = next((str(value) for scene in batch for value in scene.get("uncertainties", [])
-                       if str(value).startswith(("Bilibili frame group failed:", "Lecture slide group failed:"))), None)
+                       if str(value).startswith((
+                           "Bilibili frame group failed:",
+                           "Lecture slide group failed:",
+                           "Phonetics OCR frame group failed:",
+                       ))), None)
         if failed:
             write_json(output / "run_state.json", {
                 "status": "failed", "stage": "mimo_visual_grounding",
@@ -304,14 +449,27 @@ def main() -> None:
         write_json(output / "api_calls.json", combined_call_log())
     # One editorial call only. The raw scenes/transcript remain available for audit.
     draft_path = output / "article.content_draft.md"
-    if args.resume and draft_path.exists():
-        content_draft = draft_path.read_text(encoding="utf-8").strip()
-    else:
-        content_draft = (
-            analyzer.compose_lecture_article(scenes, transcript, metadata)
-            if args.ppt_complete
-            else analyzer.compose_article(scenes, transcript, metadata)
+    saved_pre_coverage_drafts = sorted(
+        output.glob("article.content_draft.pre_coverage_repair*.md"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if args.resume and (draft_path.exists() or saved_pre_coverage_drafts):
+        reusable_draft = (
+            draft_path if draft_path.exists() else saved_pre_coverage_drafts[0]
         )
+        content_draft = reusable_draft.read_text(encoding="utf-8").strip()
+    else:
+        if ocr_primary:
+            content_draft = analyzer.compose_phonetics_article(
+                scenes,
+                ocr_timeline,
+                metadata,
+            )
+        elif args.ppt_complete:
+            content_draft = analyzer.compose_lecture_article(scenes, transcript, metadata)
+        else:
+            content_draft = analyzer.compose_article(scenes, transcript, metadata)
     if content_draft.startswith(("# 文章生成失败", "# 课程记录生成失败")):
         write_json(output / "run_state.json", {
             "status": "failed", "stage": "mimo_article", "error": content_draft,
@@ -379,7 +537,7 @@ def main() -> None:
         write_json(output / "article.document.json", document)
         article = render_lecture_document(document)
     chosen = selected_markers(article)
-    if not args.ppt_complete:
+    if not args.ppt_complete or ocr_primary:
         crop_article_frames(scenes, frames, output, selected_frame_numbers=chosen)
     render_record(scenes, output)
     (output / "article.source.md").write_text(article + "\n", encoding="utf-8")

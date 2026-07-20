@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
@@ -23,8 +24,15 @@ class AudioProcessor:
                  device: str = "cpu",
                  initial_prompt: str = ""):
         """Initialize audio processor with specified Whisper model size or model path. By default, the medium model is used."""
+        backend_preference = os.environ.get("WHISPER_BACKEND", "auto").lower()
+        if backend_preference not in {"auto", "faster", "openai"}:
+            raise ValueError(
+                "WHISPER_BACKEND must be one of: auto, faster, openai"
+            )
         self.backend = "faster-whisper"
         try:
+            if backend_preference == "openai":
+                raise ImportError("official Whisper selected by WHISPER_BACKEND")
             from faster_whisper import WhisperModel
             
             # Log cache directory
@@ -57,6 +65,10 @@ class AudioProcessor:
                 logger.warning("FFmpeg not found. Please install ffmpeg for better audio extraction.")
                 
         except Exception as faster_error:
+            if backend_preference == "faster":
+                raise RuntimeError(
+                    "faster-whisper was explicitly selected but could not load"
+                ) from faster_error
             logger.warning("faster-whisper unavailable (%s); using official Whisper", faster_error)
             try:
                 import whisper

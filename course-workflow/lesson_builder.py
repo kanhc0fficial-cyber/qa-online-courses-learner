@@ -182,12 +182,26 @@ def _next_available(path: Path) -> Path:
 
 
 def build_lesson(record_dir: Path, lesson_id: str, part: int, source_url: str,
-                 *, source_id: str, strict_validation: bool = True) -> Path:
+                 *, source_id: str, strict_validation: bool | None = None,
+                 validation_profile: str | None = None) -> Path:
     record_dir = record_dir.resolve()
     record = _read_json(record_dir / "record.json")
     transcript = _read_json(record_dir / "transcript.json")
+    ocr_timeline = (
+        _read_json(record_dir / "ocr_timeline.json")
+        if (record_dir / "ocr_timeline.json").is_file()
+        else []
+    )
     article = (record_dir / "article.md").read_text(encoding="utf-8")
     metadata = record.get("metadata", {})
+    profile = validation_profile or str(
+        metadata.get("validation_profile")
+        or ("general_video" if strict_validation is False else "strict_course")
+    )
+    if profile not in {"strict_course", "general_video", "phonetics_course"}:
+        raise ValueError(f"不支持的课程校验包：{profile}")
+    ocr_primary = profile == "phonetics_course"
+    strict = profile in {"strict_course", "phonetics_course"}
     duration = float(metadata.get("duration", 0))
     video_path = Path(str(metadata.get("video", ""))).resolve()
     if not video_path.is_file() or duration <= 0:
@@ -201,6 +215,10 @@ def build_lesson(record_dir: Path, lesson_id: str, part: int, source_url: str,
             "facts": scene.get("visible_facts", []),
             "formulas": scene.get("formulas", []),
             "speech": scene.get("speech", ""),
+            "screen_text": scene.get("screen_text", []),
+            "ipa_symbols": scene.get("ipa_symbols", []),
+            "examples": scene.get("examples", []),
+            "articulation_cues": scene.get("articulation_cues", []),
         })
     transcript_material = [
         {
@@ -215,17 +233,30 @@ def build_lesson(record_dir: Path, lesson_id: str, part: int, source_url: str,
     materials = {
         "episode_title": title,
         "duration_seconds": duration,
+        "evidence_mode": "ocr_primary" if ocr_primary else "audio_visual",
         "audited_article": article,
-        "ppt_scenes": scene_material,
-        "timestamped_transcript": transcript_material,
+        "ocr_scenes" if ocr_primary else "ppt_scenes": scene_material,
+        "dense_ocr_timeline": ocr_timeline if ocr_primary else [],
+        "timestamped_transcript": [] if ocr_primary else transcript_material,
     }
+    timing_rule = (
+        "time 必须取自对应知识点最后一个 OCR 场景的 timestamp；不得使用字幕或语音推断时间。"
+        if ocr_primary
+        else "time 必须是老师已经讲完该知识点后的秒数，而不是刚开始讲的秒数；只能依据字幕时间。"
+    )
+    evidence_rule = (
+        "OCR 场景和审计文章是唯一事实源。保持 IPA、英文例词和中文提示原样；"
+        "不得依据字幕、语音、常识纠正或补充画面内容。"
+        if ocr_primary
+        else "只使用材料中明确讲过的内容，不补充常识性知识，不猜测。"
+    )
     prompt = f"""
 你是一名视频课程教研员。请根据下方已经审计的课程材料，生成一份可直接驱动互动视频播放器的课程 JSON。
 
 硬性要求：
-1. 只使用材料中明确讲过的内容，不补充常识性知识，不猜测。
+1. {evidence_rule}
 2. teaching_plan 用 Markdown，包含学习目标、知识结构、重点、易错点和课堂流程。
-3. 生成 {"5 到 10 个" if strict_validation else "适量的"} checkpoints，按教学顺序排列。time 必须是老师已经讲完该知识点后的秒数，而不是刚开始讲的秒数；只能依据字幕时间。
+3. 生成 {"5 到 10 个" if strict else "适量的"} checkpoints，按教学顺序排列。{timing_rule}
 4. 每个检查点 1 到 4 道简单题，默认全部使用 choice。题目只能考该时间点之前已经讲完的内容。
 5. 公式、符号、数值、单位、术语定义或精确关系式绝对不要设计成 text 填空题；必须改写成选择题，例如问“以下哪个关系式正确”。不要让学生依赖空格、括号、乘号写法、上下标或 LaTeX 格式才能答对。
 6. choice 题格式：type="choice"、options 至少两个、answers 的第一项必须与正确选项完全相同；错误选项应是材料范围内容易混淆但格式完整的表达，不使用残缺字符串。
@@ -279,8 +310,8 @@ JSON 结构：
         num_predict=8000,
     )
     return finalize_lesson_response(
-        response, record_dir, lesson_id, part, source_url, source_id, strict_validation,
-        record, article, duration, video_path,
+        response, record_dir, lesson_id, part, source_url, source_id, strict,
+        record, article, duration, video_path, validation_profile=profile,
     )
 
 
@@ -296,6 +327,7 @@ def finalize_lesson_response(
     article: str,
     duration: float,
     video_path: Path,
+    validation_profile: str | None = None,
 ) -> Path:
     """Validate and persist a saved provider response without another API call."""
     record_dir = record_dir.resolve()
@@ -322,7 +354,11 @@ def finalize_lesson_response(
         "source_url": source_url,
         "duration": duration,
         "video_path": str(video_path),
-        "subtitle_path": str(metadata.get("subtitle")) if metadata.get("subtitle") else None,
+        "subtitle_path": (
+            None
+            if validation_profile == "phonetics_course"
+            else (str(metadata.get("subtitle")) if metadata.get("subtitle") else None)
+        ),
         "record_dir": str(record_dir),
         "article_path": str(record_dir / "article.md"),
         "generation": {
@@ -330,7 +366,14 @@ def finalize_lesson_response(
             "usage": response.get("usage"),
             "finish_reason": response.get("finish_reason"),
             "automatic_retry": False,
-            "validation_profile": "strict_course" if strict_validation else "general_video",
+            "validation_profile": validation_profile or (
+                "strict_course" if strict_validation else "general_video"
+            ),
+            "evidence_mode": (
+                "ocr_primary"
+                if validation_profile == "phonetics_course"
+                else "audio_visual"
+            ),
         },
     })
     output_dir = Path(__file__).resolve().parent / "data" / "lessons"
