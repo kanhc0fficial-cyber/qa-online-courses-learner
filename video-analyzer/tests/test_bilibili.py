@@ -24,7 +24,16 @@ def test_yutto_download_is_always_limited_to_720p(monkeypatch, tmp_path: Path):
     command = build_yutto_command("BV15J41167CP", tmp_path)
 
     assert command[command.index("--video-quality") + 1] == "64"
+    assert command[command.index("--proxy") + 1] == "no"
     assert "80" not in command
+
+
+def test_yutto_proxy_can_be_explicitly_overridden(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("video_analyzer.bilibili._yutto_prefix", lambda: ["yutto"])
+
+    command = build_yutto_command("BV15J41167CP", tmp_path, proxy="auto")
+
+    assert command[command.index("--proxy") + 1] == "auto"
 
 
 def test_grounding_crop_only_selected_frame(tmp_path: Path):

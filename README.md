@@ -13,6 +13,7 @@
 - 已有完成课程时不自动重做，也不再在首页展示该课次的历史失败任务。
 - 首页按视频系列组织课程书架，支持自定义名称和排序。
 - 视频检查点支持自动退出全屏答题，并在继续播放时恢复全屏。
+- 可使用独立文章路线生成严格、配图的 Markdown；文章不进入播放课程书架。
 
 ## 三条课程链路
 
@@ -23,6 +24,20 @@
 | `phonetics_course` | 中英混合、IPA 与内嵌字幕课程 | 画面密集 OCR | 生成 |
 
 `phonetics_course` 不使用下载字幕或 Whisper。它每 0.25 秒扫描画面下部的内嵌字幕区，并把 `ocr_timeline.json` 作为可审计时间线；只要存在未确认字幕段，任务就会停止并保留现场。
+
+## 独立图文文章路线
+
+文章路线复用 `strict_course` 的完整 PPT、字幕、视觉理解、内容覆盖、数字保留、版式和图片验收，只省略题目与课程 JSON。它写入 `course-workflow/data/articles/`，不会写入 `data/lessons/`，详情页也不包含播放器。
+
+可在首页提交，也可无头运行：
+
+```powershell
+python .\course-workflow\scripts\generate_strict_article.py `
+  "BV1xxxxxxxxx" `
+  --part 7
+```
+
+默认复用下载并注册到前端文章库。Codex 中可使用 `$generate-strict-video-article` 调用同一命令。
 
 ## 项目结构
 
@@ -70,7 +85,11 @@ XIAOMI_MIMO_BASE_URL=
 .\start-course.ps1
 ```
 
-打开 <http://127.0.0.1:8765/>。启动后应同时验证规范标记，而不只是 HTTP 200：
+启动器会在电脑上打开 <http://127.0.0.1:8765/>，并默认监听局域网。连接同一路由器的平板可访问
+`http://<电脑的 WLAN IPv4 地址>:8765/`；例如电脑地址为 `192.168.1.102` 时，访问
+<http://192.168.1.102:8765/>。视频与字幕直接通过局域网传输，不需要把平板配置为使用电脑的代理。
+
+启动后应同时验证规范标记，而不只是 HTTP 200：
 
 ```powershell
 $series = Invoke-RestMethod http://127.0.0.1:8765/api/series

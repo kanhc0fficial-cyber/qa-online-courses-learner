@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import traceback
@@ -13,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
@@ -26,14 +25,21 @@ if str(ANALYZER_ROOT) not in sys.path:
     sys.path.insert(0, str(ANALYZER_ROOT))
 
 from lesson_builder import build_lesson
+from article_builder import generate_strict_article
+from analysis_runner import (
+    find_reusable_download,
+    parse_bilibili_source,
+    run_bilibili_analysis,
+)
 from video_analyzer.bilibili import download_with_yutto
 
 DATA_DIR = ROOT / "data"
 LESSONS_DIR = DATA_DIR / "lessons"
+ARTICLES_DIR = DATA_DIR / "articles"
 JOBS_DIR = DATA_DIR / "jobs"
 HOME_LAYOUT_PATH = DATA_DIR / "home_layout.json"
 STATIC_DIR = ROOT / "static"
-for directory in (LESSONS_DIR, JOBS_DIR):
+for directory in (LESSONS_DIR, ARTICLES_DIR, JOBS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="电力电子互动课程工坊")
@@ -50,6 +56,12 @@ class JobRequest(BaseModel):
     ppt_complete: bool = True
     strict_validation: bool | None = None
     validation_profile: ValidationProfile | None = None
+
+
+class ArticleJobRequest(BaseModel):
+    source: str
+    part: int | None = None
+    reuse_download: bool = True
 
 
 class DownloadBatchRequest(BaseModel):
@@ -137,33 +149,7 @@ def normalized_home_layout(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_source(source: str, explicit_part: int | None = None) -> tuple[str, str, int]:
-    text = source.strip()
-    if "://" in text:
-        parsed = urlparse(text)
-        host = (parsed.hostname or "").lower()
-        if host not in {"bilibili.com", "www.bilibili.com"}:
-            raise ValueError("只接受 bilibili.com 的分集链接")
-        if not re.fullmatch(r"/video/BV[0-9A-Za-z]+/?", parsed.path):
-            raise ValueError("请输入有效的 B 站视频链接")
-    else:
-        parsed = None
-    match = re.search(r"BV[0-9A-Za-z]+", text)
-    if not match:
-        raise ValueError("请输入 BV 号或 bilibili.com 视频链接")
-    source_id = match.group(0)
-    part = explicit_part
-    if part is None and parsed is not None:
-        values = parse_qs(parsed.query).get("p", [])
-        if values and values[0].isdigit():
-            part = int(values[0])
-    if part is None:
-        part_match = re.search(r"(?:^|[-_])p(\d+)(?:$|[-_])", text, re.I)
-        if part_match:
-            part = int(part_match.group(1))
-    part = part or 1
-    if not 1 <= part <= 999:
-        raise ValueError("分集必须在 1 到 999 之间")
-    return f"https://www.bilibili.com/video/{source_id}?p={part}", source_id, part
+    return parse_bilibili_source(source, explicit_part)
 
 
 def lesson_files() -> list[Path]:
@@ -344,7 +330,13 @@ def safe_article_file(lesson: dict[str, Any], filename: str) -> Path:
     return path
 
 
-def rewrite_article_images(markdown: str, lesson_id: str, record_dir: Path) -> str:
+def rewrite_article_images(
+    markdown: str,
+    lesson_id: str,
+    record_dir: Path,
+    collection: str = "lessons",
+    asset_route: str = "assets",
+) -> str:
     image_pattern = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+['\"][^)]*['\"])?\)")
     def replace(match: re.Match[str]) -> str:
         alt, target = match.group(1), match.group(2)
@@ -354,11 +346,16 @@ def rewrite_article_images(markdown: str, lesson_id: str, record_dir: Path) -> s
         if record_dir not in candidate.parents or not candidate.is_file():
             return f"![{alt}](missing-image)"
         relative = candidate.relative_to(record_dir).as_posix()
-        return f"![{alt}](/api/lessons/{quote(lesson_id, safe='')}/assets/{quote(relative, safe='/')})"
+        return f"![{alt}](/api/{collection}/{quote(lesson_id, safe='')}/{asset_route}/{quote(relative, safe='/')})"
     return image_pattern.sub(replace, markdown)
 
 
-def article_blocks(lesson: dict[str, Any], filename: str) -> dict[str, Any]:
+def article_blocks(
+    lesson: dict[str, Any],
+    filename: str,
+    collection: str = "lessons",
+    asset_route: str = "assets",
+) -> dict[str, Any]:
     path = safe_article_file(lesson, filename)
     record_dir = record_dir_for(lesson)
     record = record_for(lesson)
@@ -378,7 +375,9 @@ def article_blocks(lesson: dict[str, Any], filename: str) -> dict[str, Any]:
             if not anchors or anchors[-1][1] != frame_number:
                 anchors.append((index, frame_number))
     if not anchors:
-        markdown = rewrite_article_images("\n".join(lines), lesson["id"], record_dir)
+        markdown = rewrite_article_images(
+            "\n".join(lines), lesson["id"], record_dir, collection, asset_route
+        )
         return {"filename": filename, "kind": article_kind(filename), "blocks": [{
             "id": "block-001", "frame_number": None, "time": 0.0,
             "title": filename, "markdown": markdown,
@@ -404,7 +403,13 @@ def article_blocks(lesson: dict[str, Any], filename: str) -> dict[str, Any]:
         if not has_image and slide_path.is_file():
             insert_at = 1 if chunk_lines and chunk_lines[0].startswith("#") else 0
             chunk_lines[insert_at:insert_at] = ["", f"![PPT 第 {frame_number} 页](assets/frames/slide_{frame_number:03d}.jpg)", ""]
-        markdown = rewrite_article_images("\n".join(chunk_lines).strip(), lesson["id"], record_dir)
+        markdown = rewrite_article_images(
+            "\n".join(chunk_lines).strip(),
+            lesson["id"],
+            record_dir,
+            collection,
+            asset_route,
+        )
         scene = scenes.get(frame_number, {})
         heading = next((re.sub(r"^#+\s+", "", line).strip() for line in chunk_lines if re.match(r"^#+\s+", line)), "")
         blocks.append({
@@ -423,6 +428,43 @@ def find_existing_lesson(source_id: str, part: int) -> dict[str, Any] | None:
         lesson = read_json(path)
         if lesson.get("series_id") == source_id and int(lesson.get("part", -1)) == part:
             return lesson
+    return None
+
+
+def article_files() -> list[Path]:
+    return sorted(
+        ARTICLES_DIR.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def load_article_entry(article_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", article_id):
+        raise HTTPException(404, "文章不存在")
+    path = ARTICLES_DIR / f"{article_id}.json"
+    if not path.is_file():
+        raise HTTPException(404, "文章不存在")
+    return read_json(path)
+
+
+def public_article_entry(article: dict[str, Any]) -> dict[str, Any]:
+    value = dict(article)
+    value.pop("record_dir", None)
+    value.pop("article_path", None)
+    value["url"] = f"/articles/{article['id']}"
+    value["playable"] = False
+    return value
+
+
+def find_existing_article(source_id: str, part: int) -> dict[str, Any] | None:
+    for path in article_files():
+        article = read_json(path)
+        if (
+            article.get("series_id") == source_id
+            and int(article.get("part", -1)) == part
+        ):
+            return article
     return None
 
 
@@ -462,15 +504,12 @@ def find_download(
     *,
     require_subtitle: bool = False,
 ) -> Path | None:
-    pattern = re.compile(rf"{re.escape(source_id)}-p0*{part}(?:\D|$)", re.I)
-    candidates = []
-    for directory in (PROJECT_ROOT / "downloads").glob("*"):
-        if directory.is_dir() and pattern.search(directory.name):
-            has_video = bool(list(directory.rglob("*.mp4")))
-            has_subtitle = bool(list(directory.rglob("*.srt")))
-            if has_video and (has_subtitle or not require_subtitle):
-                candidates.append(directory)
-    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+    return find_reusable_download(
+        PROJECT_ROOT / "downloads",
+        source_id,
+        part,
+        require_subtitle=require_subtitle,
+    )
 
 
 def update_job(job_id: str, **changes: Any) -> dict[str, Any]:
@@ -483,74 +522,67 @@ def update_job(job_id: str, **changes: Any) -> dict[str, Any]:
     return job
 
 
+def next_job_artifact(job_id: str, suffix: str) -> Path:
+    path = JOBS_DIR / f"{job_id}.{suffix}"
+    if not path.exists():
+        return path
+    version = 2
+    while (candidate := JOBS_DIR / f"{job_id}.v{version}.{suffix}").exists():
+        version += 1
+    return candidate
+
+
+def resumable_record_dir(job: dict[str, Any]) -> Path | None:
+    if job.get("status") != "failed" or not job.get("record_dir"):
+        return None
+    record_dir = Path(str(job["record_dir"])).resolve()
+    records_root = (PROJECT_ROOT / "records").resolve()
+    if records_root not in record_dir.parents or not record_dir.is_dir():
+        return None
+    # frames.json is written before model work and is the minimum safe resume
+    # checkpoint. Audio-only failures (for example a native Whisper crash) must
+    # restart instead of presenting a misleading resume action.
+    if not (record_dir / "frames.json").is_file():
+        return None
+    return record_dir
+
+
 def run_job(job_id: str, source_url: str, source_id: str, part: int, reuse_download: bool,
             ppt_complete: bool, validation_profile: ValidationProfile,
             resume_record_dir: str | None = None) -> None:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     try:
-        if not os.environ.get("XIAOMI_MIMO_API_KEY_TEM1") or not os.environ.get("XIAOMI_MIMO_BASE_URL"):
-            raise RuntimeError("缺少 MiMo 环境变量，任务未开始下载")
         ocr_primary = validation_profile == "phonetics_course"
-        source_dir = find_download(source_id, part) if reuse_download else None
-        if source_dir:
-            update_job(job_id, stage="download", stage_label="复用已下载视频与字幕", progress=18,
-                       download_dir=str(source_dir))
-        else:
-            source_dir = PROJECT_ROOT / "downloads" / f"{source_id}-p{part:02d}_{timestamp}"
-            update_job(job_id, stage="download", stage_label="下载视频、字幕和元数据", progress=8,
-                       download_dir=str(source_dir))
-            download_with_yutto(source_url, source_dir, part)
+        log_path = next_job_artifact(job_id, "workflow.log")
 
-        mode = (
-            "phonetics_ocr"
-            if ocr_primary
-            else ("ppt_complete" if ppt_complete else "general")
-        )
-        record_dir = (
-            Path(resume_record_dir).resolve()
-            if resume_record_dir
-            else PROJECT_ROOT / "records" / f"{source_id}-p{part:02d}_{mode}_mimo-v2.5_tem1_{timestamp}"
-        )
-        log_path = JOBS_DIR / f"{job_id}.workflow.log"
-        analysis_label = (
-            "密集抽帧并以 OCR 识别音标、中英文字与例词"
-            if ocr_primary
-            else "识别 PPT、理解字幕并生成教案"
-        )
-        update_job(job_id, stage="analysis", stage_label=analysis_label, progress=28,
-                   record_dir=str(record_dir), log_path=str(log_path))
-        command = [
-            sys.executable,
-            str(ANALYZER_ROOT / "scripts" / "bilibili_workflow.py"),
-            str(source_dir),
-            "--part", str(part),
-            "--output", str(record_dir),
-            "--model", "mimo-v2.5",
-            "--api-key-env", "XIAOMI_MIMO_API_KEY_TEM1",
-            "--validation-profile", validation_profile,
-        ]
-        if ppt_complete and not ocr_primary:
-            command += ["--ppt-complete", "--ppt-ignore-head", "18", "--ppt-ignore-tail", "10"]
-        if resume_record_dir:
-            command.append("--resume")
-        environment = dict(os.environ)
-        environment["PYTHONUTF8"] = "1"
-        environment["PYTHONIOENCODING"] = "utf-8"
-        environment.setdefault("WHISPER_MODEL", "medium")
-        environment.setdefault("WHISPER_BACKEND", "openai")
-        environment.setdefault("HF_HUB_DISABLE_XET", "1")
-        environment.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-        with log_path.open("w", encoding="utf-8") as log:
-            subprocess.run(
-                command,
-                cwd=ANALYZER_ROOT,
-                env=environment,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                check=True,
+        def report(
+            stage: str,
+            stage_label: str,
+            progress: int,
+            details: dict[str, Any],
+        ) -> None:
+            update_job(
+                job_id,
+                stage=stage,
+                stage_label=stage_label,
+                progress=progress,
+                **details,
             )
+
+        analysis = run_bilibili_analysis(
+            source_url,
+            source_id,
+            part,
+            project_root=PROJECT_ROOT,
+            analyzer_root=ANALYZER_ROOT,
+            reuse_download=reuse_download,
+            ppt_complete=ppt_complete,
+            validation_profile=validation_profile,
+            output=Path(resume_record_dir) if resume_record_dir else None,
+            resume=bool(resume_record_dir),
+            log_path=log_path,
+            progress=report,
+        )
+        record_dir = analysis["record_dir"]
 
         quiz_label = (
             "依据 OCR 场景时间线生成音标练习"
@@ -565,10 +597,72 @@ def run_job(job_id: str, source_url: str, source_id: str, part: int, reuse_downl
         update_job(job_id, status="complete", stage="complete", stage_label="课程网址已就绪",
                    progress=100, lesson_id=lesson["id"], lesson_url=f"/lessons/{lesson['id']}")
     except Exception as exc:
-        error_path = JOBS_DIR / f"{job_id}.error.log"
+        error_path = next_job_artifact(job_id, "error.log")
         error_path.write_text(traceback.format_exc(), encoding="utf-8")
         update_job(job_id, status="failed", stage="failed", stage_label="任务已停止",
                    error=str(exc), error_log=str(error_path))
+
+
+def run_article_job(
+    job_id: str,
+    source_url: str,
+    source_id: str,
+    part: int,
+    reuse_download: bool,
+    resume_record_dir: str | None = None,
+) -> None:
+    """Generate and publish an article without invoking the lesson builder."""
+    try:
+        if not os.environ.get("XIAOMI_MIMO_API_KEY_TEM1") or not os.environ.get(
+            "XIAOMI_MIMO_BASE_URL"
+        ):
+            raise RuntimeError("缺少 MiMo 环境变量，任务未开始下载")
+
+        def report(
+            stage: str,
+            stage_label: str,
+            progress: int,
+            details: dict[str, Any],
+        ) -> None:
+            update_job(
+                job_id,
+                stage=stage,
+                stage_label=stage_label,
+                progress=progress,
+                **details,
+            )
+
+        entry = generate_strict_article(
+            source_url,
+            part=part,
+            output=Path(resume_record_dir) if resume_record_dir else None,
+            reuse_download=reuse_download,
+            resume=bool(resume_record_dir),
+            article_id=job_id,
+            publish_dir=ARTICLES_DIR,
+            progress=report,
+        )
+        update_job(
+            job_id,
+            status="complete",
+            stage="complete",
+            stage_label="严格图文文章已就绪",
+            progress=100,
+            article_id=entry["id"],
+            article_url=f"/articles/{entry['id']}",
+            record_dir=entry["record_dir"],
+        )
+    except Exception as exc:
+        error_path = next_job_artifact(job_id, "error.log")
+        error_path.write_text(traceback.format_exc(), encoding="utf-8")
+        update_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            stage_label="文章任务已停止",
+            error=str(exc),
+            error_log=str(error_path),
+        )
 
 
 def run_download_job(job_id: str, source_url: str, source_id: str, part: int,
@@ -651,6 +745,7 @@ def validate_part_range(start_part: int, end_part: int) -> list[int]:
 def get_series() -> dict[str, Any]:
     lesson_values = [read_json(path) for path in lesson_files()]
     lessons = [public_lesson(lesson) for lesson in lesson_values]
+    articles = [public_article_entry(read_json(path)) for path in article_files()]
     job_values = [
         read_json(path)
         for path in JOBS_DIR.glob("*.json")
@@ -660,12 +755,15 @@ def get_series() -> dict[str, Any]:
         key=lambda job: str(job.get("updated_at", job.get("created_at", ""))),
         reverse=True,
     )[:20]
+    for job in jobs:
+        job["resume_supported"] = resumable_record_dir(job) is not None
     return {
         "title": "互动课程工坊",
         "canonical": True,
         "canonical_root": str(ROOT.resolve()),
         "data_dir": str(DATA_DIR.resolve()),
         "lessons": lessons,
+        "articles": articles,
         "jobs": jobs,
     }
 
@@ -716,6 +814,7 @@ def create_job(request: JobRequest) -> dict[str, Any]:
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     job = {
         "id": job_id,
+        "kind": "lesson",
         "status": "running",
         "stage": "queued",
         "stage_label": "等待开始",
@@ -739,6 +838,146 @@ def create_job(request: JobRequest) -> dict[str, Any]:
     )
     thread.start()
     return job
+
+
+@app.post("/api/article-jobs")
+def create_article_job(request: ArticleJobRequest) -> dict[str, Any]:
+    try:
+        source_url, source_id, part = parse_source(request.source, request.part)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    existing = find_existing_article(source_id, part)
+    if existing:
+        return {
+            "status": "exists",
+            "part": part,
+            "article_id": existing["id"],
+            "article_url": f"/articles/{existing['id']}",
+            "message": f"{source_id} P{part} 已有严格图文文章。",
+        }
+    active_jobs = []
+    for path in JOBS_DIR.glob("*.json"):
+        job = read_json(path)
+        if job.get("status") in {"queued", "running"}:
+            active_jobs.append(job)
+    duplicate = next(
+        (
+            job
+            for job in active_jobs
+            if job.get("kind") == "article"
+            and job.get("source_id") == source_id
+            and int(job.get("part", -1)) == part
+        ),
+        None,
+    )
+    if duplicate:
+        raise HTTPException(409, f"P{part} 的文章正在生成，不能重复提交")
+    if len(active_jobs) >= MAX_ACTIVE_JOBS:
+        raise HTTPException(409, f"并发制造已达到上限 {MAX_ACTIVE_JOBS}")
+    job_id = f"article-p{part:02d}-{datetime.now():%Y%m%d-%H%M%S-%f}"
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    job = {
+        "id": job_id,
+        "kind": "article",
+        "status": "running",
+        "stage": "queued",
+        "stage_label": "等待生成严格图文文章",
+        "progress": 2,
+        "part": part,
+        "source_id": source_id,
+        "source_url": source_url,
+        "reuse_download": request.reuse_download,
+        "ppt_complete": True,
+        "validation_profile": "strict_course",
+        "playable": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    write_json_atomic(JOBS_DIR / f"{job_id}.json", job)
+    threading.Thread(
+        target=run_article_job,
+        args=(job_id, source_url, source_id, part, request.reuse_download),
+        daemon=True,
+        name=job_id,
+    ).start()
+    return job
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def resume_job(job_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+        raise HTTPException(404, "任务不存在")
+    path = JOBS_DIR / f"{job_id}.json"
+    if not path.is_file():
+        raise HTTPException(404, "任务不存在")
+    job = read_json(path)
+    record_dir = resumable_record_dir(job)
+    if record_dir is None:
+        raise HTTPException(409, "该失败任务没有可恢复的帧与场景，请重新制作")
+    other_jobs = [
+        read_json(candidate)
+        for candidate in JOBS_DIR.glob("*.json")
+        if candidate != path
+    ]
+    duplicate = next((
+        value for value in other_jobs
+        if value.get("status") in {"queued", "running"}
+        and value.get("source_id") == job.get("source_id")
+        and int(value.get("part", -1)) == int(job.get("part", -1))
+    ), None)
+    if duplicate:
+        raise HTTPException(409, f"P{job['part']} 已在制造中，不能重复继续")
+    active_count = sum(
+        value.get("status") in {"queued", "running"}
+        for value in other_jobs
+    )
+    if active_count >= MAX_ACTIVE_JOBS:
+        raise HTTPException(409, f"并发制造已达到上限 {MAX_ACTIVE_JOBS}")
+
+    resumed = update_job(
+        job_id,
+        status="running",
+        stage="queued",
+        stage_label="从保留现场继续",
+        progress=max(2, min(int(job.get("progress", 2)), 82)),
+        error=None,
+        previous_error=job.get("error"),
+        previous_error_log=job.get("error_log"),
+    )
+    if job.get("kind") == "article":
+        target = run_article_job
+        args = (
+            job_id,
+            str(job["source_url"]),
+            str(job["source_id"]),
+            int(job["part"]),
+            True,
+            str(record_dir),
+        )
+    else:
+        validation_profile = resolve_validation_profile(
+            job.get("validation_profile"),
+            None,
+        )
+        target = run_job
+        args = (
+            job_id,
+            str(job["source_url"]),
+            str(job["source_id"]),
+            int(job["part"]),
+            True,
+            bool(job.get("ppt_complete", True)),
+            validation_profile,
+            str(record_dir),
+        )
+    thread = threading.Thread(
+        target=target,
+        args=args,
+        daemon=True,
+        name=f"resume-{job_id}",
+    )
+    thread.start()
+    return resumed
 
 
 @app.post("/api/download-batches")
@@ -950,6 +1189,34 @@ def get_lesson_asset(lesson_id: str, asset_path: str) -> FileResponse:
     path = (record_dir / asset_path.replace("/", os.sep)).resolve()
     if record_dir not in path.parents or not path.is_file():
         raise HTTPException(404, "课程图片不存在")
+    return FileResponse(path)
+
+
+@app.get("/api/articles/{article_id}")
+def get_standalone_article(article_id: str) -> dict[str, Any]:
+    article = load_article_entry(article_id)
+    value = public_article_entry(article)
+    value["content_url"] = f"/api/articles/{article_id}/content"
+    return value
+
+
+@app.get("/api/articles/{article_id}/content")
+def get_standalone_article_content(article_id: str) -> dict[str, Any]:
+    article = load_article_entry(article_id)
+    return article_blocks(
+        article, "article.md", collection="articles", asset_route="files"
+    )
+
+
+@app.get("/api/articles/{article_id}/files/{asset_path:path}")
+def get_standalone_article_asset(
+    article_id: str, asset_path: str
+) -> FileResponse:
+    article = load_article_entry(article_id)
+    record_dir = record_dir_for(article)
+    path = (record_dir / asset_path.replace("/", os.sep)).resolve()
+    if record_dir not in path.parents or not path.is_file():
+        raise HTTPException(404, "文章图片不存在")
     return FileResponse(path)
 
 

@@ -2,6 +2,8 @@ import requests
 import json
 import time
 import re
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from .llm_client import LLMClient
 import logging
@@ -11,11 +13,15 @@ logger = logging.getLogger(__name__)
 # Constants
 DEFAULT_MAX_RETRIES = 3
 RATE_LIMIT_WAIT_TIME = 25  # seconds
-DEFAULT_WAIT_TIME = 25  # seconds
+DEFAULT_WAIT_TIME = 2  # seconds
+MAX_WAIT_TIME = 60  # seconds
+RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
 
 class GenericOpenAIAPIClient(LLMClient):
     def __init__(self, api_key: str, api_url: str, max_retries: int = DEFAULT_MAX_RETRIES,
                  api_key_header: str = "Authorization"):
+        if max_retries < 1:
+            raise ValueError("max_retries must be at least 1")
         self.api_key = api_key
         self.base_url = api_url.rstrip('/')  # Remove trailing slash if present
         self.generate_url = f"{self.base_url}/chat/completions"
@@ -98,26 +104,61 @@ class GenericOpenAIAPIClient(LLMClient):
                 except json.JSONDecodeError:
                     raise Exception(f"Invalid JSON response: {response.text}")
                     
-            except Exception as e:
-                if attempt == self.max_retries - 1:  # Last attempt
-                    raise Exception(f"An error occurred: {str(e)}")
-                
-                # Get wait time based on error
-                wait_time = RATE_LIMIT_WAIT_TIME
-                if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
-                    # Try to get wait time from Retry-After header
-                    if 'Retry-After' in e.response.headers:
-                        try:
-                            wait_time = int(e.response.headers['Retry-After'])
-                            logger.info(f"Using Retry-After header value: {wait_time} seconds")
-                        except (ValueError, TypeError):
-                            logger.warning("Invalid Retry-After header value, using default wait time")
-                else:
-                    wait_time = DEFAULT_WAIT_TIME
-                
-                logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                logger.warning(f"Waiting {wait_time} seconds before retry")
+            except Exception as exc:
+                attempts = attempt + 1
+                if attempts == self.max_retries or not self._is_retryable(exc):
+                    raise RuntimeError(
+                        f"API request failed after {attempts} attempt(s): {exc}"
+                    ) from exc
+
+                wait_time = self._retry_wait_seconds(exc, attempt)
+                logger.warning(
+                    "Request failed (attempt %s/%s): %s",
+                    attempts,
+                    self.max_retries,
+                    exc,
+                )
+                logger.warning("Waiting %.1f seconds before retry", wait_time)
                 time.sleep(wait_time)
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, (requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout)):
+            return True
+        if isinstance(exc, requests.exceptions.HTTPError):
+            response = exc.response
+            if response is None:
+                return False
+            status = response.status_code
+            return status in RETRYABLE_STATUS_CODES or 500 <= status < 600
+        # A successful HTTP response with malformed or incomplete JSON can be a
+        # transient upstream failure, so preserve the historical retry behavior.
+        return True
+
+    @staticmethod
+    def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
+        default_wait = min(DEFAULT_WAIT_TIME * (2 ** attempt), MAX_WAIT_TIME)
+        if not isinstance(exc, requests.exceptions.HTTPError):
+            return default_wait
+        response = exc.response
+        if response is None or response.status_code != 429:
+            return default_wait
+        value = response.headers.get("Retry-After")
+        if not value:
+            return RATE_LIMIT_WAIT_TIME
+        try:
+            return min(max(float(value), 0.0), MAX_WAIT_TIME)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                return min(max(delay, 0.0), MAX_WAIT_TIME)
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Invalid Retry-After header; using default rate-limit wait")
+                return RATE_LIMIT_WAIT_TIME
 
     def _handle_streaming_response(self, response: requests.Response) -> Dict[Any, Any]:
         """Handle streaming response from API.

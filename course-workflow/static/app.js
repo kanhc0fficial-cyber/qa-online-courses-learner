@@ -8,6 +8,61 @@ const normalize = value => String(value || "").toLowerCase().replace(/[\s（）(
 let layoutEditing = false;
 let homeLayout = {source_order:[], lesson_order:{}, titles:{}};
 
+function captureDashboardDraft() {
+  const jobForm = document.querySelector("#job-form");
+  const batchForm = document.querySelector("#batch-form");
+  const articleForm = document.querySelector("#article-form");
+  if (!jobForm || !batchForm || !articleForm) return null;
+  return {
+    job: {
+      source: jobForm.source.value,
+      part: jobForm.part.value,
+      reuse: document.querySelector("#reuse").checked,
+      validationProfile: document.querySelector("#validation-profile").value,
+      pptComplete: document.querySelector("#ppt-complete").checked,
+    },
+    batch: {
+      source: batchForm.source.value,
+      startPart: batchForm.startPart.value,
+      endPart: batchForm.endPart.value,
+      action: document.querySelector("#batch-action").value,
+      executionMode: batchForm.executionMode.value,
+      reuse: document.querySelector("#batch-reuse").checked,
+      validationProfile: document.querySelector("#batch-validation-profile").value,
+      pptComplete: document.querySelector("#batch-ppt-complete").checked,
+    },
+    article: {
+      source: articleForm.source.value,
+      part: articleForm.part.value,
+      reuse: document.querySelector("#article-reuse").checked,
+    },
+  };
+}
+
+function restoreDashboardDraft(draft) {
+  if (!draft) return;
+  const jobForm = document.querySelector("#job-form");
+  const batchForm = document.querySelector("#batch-form");
+  const articleForm = document.querySelector("#article-form");
+  if (!jobForm || !batchForm || !articleForm) return;
+  jobForm.source.value = draft.job.source;
+  jobForm.part.value = draft.job.part;
+  document.querySelector("#reuse").checked = draft.job.reuse;
+  document.querySelector("#validation-profile").value = draft.job.validationProfile;
+  document.querySelector("#ppt-complete").checked = draft.job.pptComplete;
+  batchForm.source.value = draft.batch.source;
+  batchForm.startPart.value = draft.batch.startPart;
+  batchForm.endPart.value = draft.batch.endPart;
+  document.querySelector("#batch-action").value = draft.batch.action;
+  document.querySelector("#execution-mode").value = draft.batch.executionMode;
+  document.querySelector("#batch-reuse").checked = draft.batch.reuse;
+  document.querySelector("#batch-validation-profile").value = draft.batch.validationProfile;
+  document.querySelector("#batch-ppt-complete").checked = draft.batch.pptComplete;
+  articleForm.source.value = draft.article.source;
+  articleForm.part.value = draft.article.part;
+  document.querySelector("#article-reuse").checked = draft.article.reuse;
+}
+
 function header(extra = "") {
   return `<header class="site-header">
     <a class="logo" href="/" aria-label="返回课程工坊首页"><img src="/static/course-flow.svg" alt=""></a>
@@ -24,7 +79,7 @@ function renderMarkdown(source) {
     .replace(/<strong>([^]*?)<\/strong>/gi, "**$1**")
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, url) => {
       const safeUrl = String(url).trim();
-      const allowed = safeUrl.startsWith("/api/lessons/") || safeUrl === "missing-image";
+      const allowed = safeUrl.startsWith("/api/lessons/") || safeUrl.startsWith("/api/articles/") || safeUrl === "missing-image";
       const token = `@@ARTICLE_IMAGE_${images.length}@@`;
       images.push({alt: String(alt || "课程图片"), url: allowed ? safeUrl : "missing-image"});
       return token;
@@ -113,8 +168,11 @@ async function dashboard() {
   ]);
   homeLayout = layout;
   const shelves = buildCourseShelves(data.lessons, homeLayout);
+  const articles = data.articles || [];
+  // Polling refreshes job status every few seconds. Keep unfinished form input intact.
+  const draft = captureDashboardDraft();
   app.innerHTML = `<main class="shell">
-    ${header()}
+    ${header(`<a class="back-link" href="#article-library">图文文章 ${articles.length} 篇 ↓</a>`)}
     <section class="hero">
       <div class="hero-copy">
         <img class="hero-illustration" src="/static/course-flow.svg" alt="课程知识路径图" loading="eager">
@@ -152,15 +210,30 @@ async function dashboard() {
         <label class="check-field"><input id="batch-reuse" type="checkbox" checked> 已下载的分集直接复用</label>
         <button class="submit-button" type="submit">开始批量下载 →</button><p class="form-message" id="batch-message"></p>
       </form>
+      <form class="submit-card article-submit-card" id="article-form">
+        <p class="eyebrow">ARTICLE ONLY</p><h3>生成严格图文文章</h3><p>复用原严格课程分析管线，只发布带图片的 Markdown；不生成题目，不进入播放器课程。</p>
+        <div class="field"><label for="article-source">B站视频链接或 BV 号</label><input id="article-source" name="source" required placeholder="BV... 或视频链接"></div>
+        <div class="field-row">
+          <div class="field"><label for="article-part">分集 P</label><input id="article-part" name="part" type="number" min="1" max="999" placeholder="1"></div>
+          <label class="check-field"><input id="article-reuse" type="checkbox" checked> 优先复用已下载视频</label>
+        </div>
+        <div class="article-policy"><span>固定路线</span><strong>严格校验 · 完整 PPT · 配图</strong></div>
+        <button class="submit-button" type="submit">开始生成文章 →</button><p class="form-message" id="article-message"></p>
+      </form>
       </div>
     </section>
     <div class="section-head task-status-head"><div><p class="eyebrow">PIPELINE STATUS</p><h2>当前与最近任务</h2></div><span>失败现场会保留；可恢复的音标 OCR 从已完成段继续</span></div>
     <section class="jobs-panel prominent-jobs"><div class="job-list" id="job-list">${renderJobs(data.jobs)}</div></section>
+    <div class="section-head" id="article-library"><div><p class="eyebrow">READ WITHOUT PLAYER</p><h2>图文文章</h2></div><span>${articles.length} 篇 · 严格对齐视频 · 不纳入播放课程</span></div>
+    <section class="article-library">${articles.length ? articles.map(articleCard).join("") : `<div class="empty">尚无独立图文文章</div>`}</section>
     <div class="section-head course-display-head"><div><p class="eyebrow">READY TO LEARN</p><h2>课程陈列</h2></div><div class="display-actions"><span>${shelves.length} 个陈列 · ${data.lessons.length} 节可播放</span><button class="layout-button" id="layout-toggle">${layoutEditing ? "完成调整" : "调整陈列"}</button>${layoutEditing ? `<button class="layout-button subtle" id="layout-reset">恢复默认排序</button>` : ""}</div></div>
     <section class="course-shelves">${shelves.length ? shelves.map((shelf,index)=>courseShelf(shelf,index,shelves.length)).join("") : `<div class="empty">尚无完成课程</div>`}</section>
   </main>`;
+  restoreDashboardDraft(draft);
   bindJobForm();
   bindBatchForm();
+  bindArticleForm();
+  bindResumeButtons();
   bindLayoutControls(shelves);
   if (data.jobs.some(job => ["queued","running"].includes(job.status))) pollDashboard();
 }
@@ -259,16 +332,45 @@ function lessonCard(lesson) {
   return `<a class="lesson-card" href="${lesson.url}"><div class="lesson-top"><span class="part-badge">P${String(lesson.part).padStart(2,"0")}</span><span class="ready-badge">● 已就绪</span></div><h3>${escapeHtml(lesson.title)}</h3><p>${escapeHtml(lesson.overview || "教案、题目和时间戳已经生成。")}</p><div class="lesson-meta"><span>${formatTime(lesson.duration || 0)}</span><span>${lesson.checkpoints.length} 检查点</span><span>${questions} 题</span><b class="lesson-arrow">→</b></div></a>`;
 }
 
+function articleCard(article) {
+  return `<a class="lesson-card article-card" href="${escapeHtml(article.url)}"><div class="lesson-top"><span class="part-badge">P${String(article.part).padStart(2,"0")}</span><span class="article-only-badge">文章 · 无播放</span></div><h3>${escapeHtml(article.title)}</h3><p>严格对齐视频内容的 Markdown 图文记录。</p><div class="lesson-meta"><span>${article.image_count || 0} 张图</span><span>${article.section_count || 0} 个内容段</span><b class="lesson-arrow">→</b></div></a>`;
+}
+
 function renderJobs(jobs) {
   if (!jobs.length) return `<div class="empty">提交分集后，进度会显示在这里。</div>`;
   return jobs.map(job => {
-    const completeStatus = job.kind === "download" ? "已下载" : `<a href="${job.lesson_url}">打开课程 →</a>`;
-    const status = job.status === "complete" ? completeStatus : escapeHtml(job.status.toUpperCase());
-    const kind = job.kind === "download" ? `<span class="job-kind">下载 · 720p</span>` : "";
-    const profile = job.validation_profile === "phonetics_course" ? "音标课程 · OCR" : (job.validation_profile === "strict_course" ? "严格课程" : "通用视频");
+    const completeStatus = job.kind === "download"
+      ? "已下载"
+      : (job.kind === "article" ? `<a href="${job.article_url}">打开文章 →</a>` : `<a href="${job.lesson_url}">打开课程 →</a>`);
+    const status = job.status === "complete"
+      ? completeStatus
+      : (job.status === "failed" && job.resume_supported
+        ? `<button class="layout-button" data-resume-job="${escapeHtml(job.id)}">继续 →</button>`
+        : escapeHtml(job.status.toUpperCase()));
+    const kind = job.kind === "download" ? `<span class="job-kind">下载 · 720p</span>` : (job.kind === "article" ? `<span class="job-kind">文章 · 无播放</span>` : "");
+    const profile = job.kind === "article" ? "严格图文文章" : (job.validation_profile === "phonetics_course" ? "音标课程 · OCR" : (job.validation_profile === "strict_course" ? "严格课程" : "通用视频"));
     const source = job.source_id ? `${profile} · ${job.source_id}` : profile;
     return `<div class="job ${job.status}"><strong>P${String(job.part).padStart(2,"0")}${kind}</strong><div class="job-copy"><b class="job-source">${escapeHtml(source)}</b><span>${escapeHtml(job.stage_label || job.stage)}</span><div class="job-progress"><i style="width:${job.progress || 0}%"></i></div>${job.error ? `<span>${escapeHtml(job.error)}</span>`:""}</div><div class="job-status">${status}</div></div>`;
   }).join("");
+}
+
+function bindResumeButtons() {
+  document.querySelectorAll("[data-resume-job]").forEach(button => {
+    button.onclick = async () => {
+      button.disabled = true;
+      button.textContent = "继续中…";
+      try {
+        await jsonFetch(`/api/jobs/${encodeURIComponent(button.dataset.resumeJob)}/resume`, {
+          method:"POST",
+        });
+        await dashboard();
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = "继续 →";
+        window.alert(error.message);
+      }
+    };
+  });
 }
 
 function bindJobForm() {
@@ -300,6 +402,41 @@ function bindJobForm() {
     } catch (error) { message.textContent = error.message; }
     finally { button.disabled = false; }
   });
+}
+
+function bindArticleForm() {
+  const form = document.querySelector("#article-form");
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const button = form.querySelector("button");
+    const message = document.querySelector("#article-message");
+    button.disabled = true;
+    button.textContent = "正在提交…";
+    message.textContent = "";
+    try {
+      const payload = {
+        source: form.source.value,
+        part: form.part.value ? Number(form.part.value) : null,
+        reuse_download: document.querySelector("#article-reuse").checked,
+      };
+      const result = await jsonFetch("/api/article-jobs", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(payload),
+      });
+      if (result.status === "exists") {
+        message.innerHTML = `已有文章。<a href="${escapeHtml(result.article_url)}">打开文章 →</a>`;
+      } else {
+        message.textContent = `P${result.part} 文章任务已开始；完成后只进入图文文章区。`;
+        setTimeout(refreshDashboardToJobs, 600);
+      }
+    } catch (error) {
+      message.textContent = error.message;
+    } finally {
+      button.disabled = false;
+      button.textContent = "开始生成文章 →";
+    }
+  };
 }
 
 function bindBatchForm() {
@@ -549,10 +686,27 @@ async function lessonPage(id) {
   }
 }
 
+async function articlePage(id) {
+  const [article, content] = await Promise.all([
+    jsonFetch(`/api/articles/${encodeURIComponent(id)}`),
+    jsonFetch(`/api/articles/${encodeURIComponent(id)}/content`),
+  ]);
+  app.innerHTML = `<main class="shell article-reader-shell">
+    ${header(`<div class="lesson-header-actions"><a class="back-link" href="/">← 返回工坊</a><div class="series-lock"><i class="lock-dot"></i><span>图文路线 · 无播放器</span></div></div>`)}
+    <article class="content-panel standalone-article">
+      <header class="standalone-article-header"><p class="eyebrow">STRICT ILLUSTRATED ARTICLE · P${String(article.part).padStart(2,"0")}</p><h2>${escapeHtml(article.title)}</h2><p>本文由严格课程分析管线生成，并作为独立 Markdown 文章发布；不会进入可播放课程。</p><div class="article-file-note"><span class="article-kind final">严格文章</span><span>${article.image_count || 0} 张图</span><span>${content.blocks.length} 个内容段</span><a href="${escapeHtml(article.source_url)}" target="_blank" rel="noreferrer">原视频 ↗</a></div></header>
+      <div class="article-timeline standalone-timeline">${content.blocks.map((block,index)=>`<section class="article-time-block"><div class="article-time-rail"><span>SECTION ${String(index+1).padStart(2,"0")}</span>${block.frame_number ? `<span>PPT ${String(block.frame_number).padStart(2,"0")}</span>` : ""}</div><div class="article-block-body"><p class="block-title">${escapeHtml(block.title)}</p>${renderMarkdown(block.markdown)}</div></section>`).join("")}</div>
+    </article>
+  </main>`;
+}
+
 async function route() {
   try {
-    const match=location.pathname.match(/^\/lessons\/([^/]+)\/?$/);
-    if(match) await lessonPage(decodeURIComponent(match[1])); else await dashboard();
+    const lessonMatch=location.pathname.match(/^\/lessons\/([^/]+)\/?$/);
+    const articleMatch=location.pathname.match(/^\/articles\/([^/]+)\/?$/);
+    if(lessonMatch) await lessonPage(decodeURIComponent(lessonMatch[1]));
+    else if(articleMatch) await articlePage(decodeURIComponent(articleMatch[1]));
+    else await dashboard();
   } catch(error) { app.innerHTML=`<div class="loading-screen"><h2>页面没有准备好</h2><p>${escapeHtml(error.message)}</p><a class="back-link" href="/">返回首页</a></div>`; }
 }
 route();

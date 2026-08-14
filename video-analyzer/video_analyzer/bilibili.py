@@ -154,7 +154,12 @@ def _yutto_prefix() -> List[str]:
     raise RuntimeError("yutto is not installed. Install with: pip install 'video-analyzer[bilibili]'")
 
 
-def build_yutto_command(source: str, output_dir: Path, part: Optional[int] = None) -> List[str]:
+def build_yutto_command(
+    source: str,
+    output_dir: Path,
+    part: Optional[int] = None,
+    proxy: str = "no",
+) -> List[str]:
     return _yutto_prefix() + [
         normalize_bilibili_url(source, part),
         "--video-quality", YUTTO_720P_QUALITY,
@@ -164,12 +169,18 @@ def build_yutto_command(source: str, output_dir: Path, part: Optional[int] = Non
         "--no-color",
         "--no-progress",
         "--vcodec=avc:copy",
+        "--proxy", proxy,
     ]
 
 
-def download_with_yutto(source: str, output_dir: Path, part: Optional[int] = None) -> Path:
+def download_with_yutto(
+    source: str,
+    output_dir: Path,
+    part: Optional[int] = None,
+    proxy: str = "no",
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    command = build_yutto_command(source, output_dir, part)
+    command = build_yutto_command(source, output_dir, part, proxy)
     with (output_dir / "yutto.stdout.log").open("w", encoding="utf-8") as stdout, \
             (output_dir / "yutto.stderr.log").open("w", encoding="utf-8") as stderr:
         subprocess.run(command, stdout=stdout, stderr=stderr, text=True, encoding="utf-8", check=True)

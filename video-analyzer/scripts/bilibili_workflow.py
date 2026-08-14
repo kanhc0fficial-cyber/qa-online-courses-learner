@@ -140,6 +140,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="最省 token 的 B 站视频图文流程")
     parser.add_argument("source", help="已有下载目录、BV号或B站链接")
     parser.add_argument("--part", type=int)
+    parser.add_argument(
+        "--proxy",
+        default="no",
+        help="仅控制本次 yutto 的代理；默认 no，不读取系统代理",
+    )
     parser.add_argument("--download-root", type=Path, default=ROOT.parent / "downloads")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--prepare-only", action="store_true")
@@ -151,6 +156,12 @@ def main() -> None:
     )
     parser.add_argument("--api-key-env", default="XIAOMI_MIMO_API_KEY")
     parser.add_argument("--base-url-env", default="XIAOMI_MIMO_BASE_URL")
+    parser.add_argument(
+        "--api-max-retries",
+        type=int,
+        default=3,
+        help="Transient API attempts per model call (default: 3)",
+    )
     parser.add_argument("--ppt-complete", action="store_true",
                         help="Detect every stable change inside the fixed PPT screen region")
     parser.add_argument("--ppt-ignore-head", type=float, default=0.0)
@@ -170,7 +181,7 @@ def main() -> None:
         source_dir = source_path.resolve()
     else:
         source_dir = (args.download_root / datetime.now().strftime("bilibili_%Y%m%d-%H%M%S")).resolve()
-        download_with_yutto(args.source, source_dir, args.part)
+        download_with_yutto(args.source, source_dir, args.part, proxy=args.proxy)
 
     assets = discover_bilibili_assets(source_dir)
     mode_name = (
@@ -306,7 +317,8 @@ def main() -> None:
             "scene_scope": "fixed_ppt_region_only",
         } if args.ppt_complete and not ocr_primary else None),
         "token_policy": {"visual_calls": "ceil(frames/4)" if args.ppt_complete or ocr_primary else "ceil(frames/6)", "article_calls": 1,
-                         "fact_check_call": False, "automatic_retry": False},
+                         "fact_check_call": False, "automatic_retry": True,
+                         "api_max_attempts_per_call": args.api_max_retries},
     }
     write_json(output / "source_manifest.json", manifest)
     write_json(output / "transcript.json", {
@@ -333,7 +345,7 @@ def main() -> None:
 
     client = GenericOpenAIAPIClient(
         os.environ[args.api_key_env], os.environ[args.base_url_env],
-        max_retries=1, api_key_header="api-key",
+        max_retries=args.api_max_retries, api_key_header="api-key",
     )
     analyzer = VideoAnalyzer(client, args.model, PromptLoader("", PROMPTS), 0.0)
     record_path = output / "record.json"
@@ -471,8 +483,14 @@ def main() -> None:
         else:
             content_draft = analyzer.compose_article(scenes, transcript, metadata)
     if content_draft.startswith(("# 文章生成失败", "# 课程记录生成失败")):
+        write_json(output / "api_calls.json", combined_call_log())
         write_json(output / "run_state.json", {
-            "status": "failed", "stage": "mimo_article", "error": content_draft,
+            "status": "failed",
+            "stage": "mimo_article",
+            "error": content_draft,
+            "completed_scenes": len(scenes),
+            "resume_supported": True,
+            "resume_hint": "rerun the same command with --resume",
         })
         raise RuntimeError(content_draft)
     article = content_draft

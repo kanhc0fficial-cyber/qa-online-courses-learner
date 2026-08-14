@@ -199,6 +199,62 @@ def test_concurrent_limit_rejects_duplicate_part(monkeypatch, tmp_path):
         server.create_job(server.JobRequest(source="BV1pS4y1g7D9", part=17))
 
 
+def test_resume_failed_job_reuses_record_directory(monkeypatch, tmp_path):
+    jobs_dir = tmp_path / "jobs"
+    records_dir = tmp_path / "records"
+    record_dir = records_dir / "p39-record"
+    jobs_dir.mkdir()
+    record_dir.mkdir(parents=True)
+    (record_dir / "frames.json").write_text("[]", encoding="utf-8")
+    job = {
+        "id": "p39-failed",
+        "status": "failed",
+        "stage": "failed",
+        "progress": 82,
+        "part": 39,
+        "source_id": "BV1pS4y1g7D9",
+        "source_url": "https://www.bilibili.com/video/BV1pS4y1g7D9?p=39",
+        "record_dir": str(record_dir),
+        "ppt_complete": True,
+        "validation_profile": "strict_course",
+        "error": "temporary API failure",
+    }
+    (jobs_dir / "p39-failed.json").write_text(
+        json.dumps(job), encoding="utf-8"
+    )
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon, name):
+            self.args = args
+
+        def start(self):
+            started.append(self.args)
+
+    monkeypatch.setattr(server, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(server, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(server.threading, "Thread", FakeThread)
+
+    result = server.resume_job("p39-failed")
+
+    assert result["status"] == "running"
+    assert result["stage_label"] == "从保留现场继续"
+    assert result["previous_error"] == "temporary API failure"
+    assert started[0][-1] == str(record_dir.resolve())
+
+
+def test_audio_only_failure_is_not_resumable(monkeypatch, tmp_path):
+    record_dir = tmp_path / "records" / "p19-record"
+    record_dir.mkdir(parents=True)
+    (record_dir / "audio.wav").write_bytes(b"audio")
+    monkeypatch.setattr(server, "PROJECT_ROOT", tmp_path)
+
+    assert server.resumable_record_dir({
+        "status": "failed",
+        "record_dir": str(record_dir),
+    }) is None
+
+
 def test_series_hides_failed_jobs_for_completed_parts(monkeypatch, tmp_path):
     lessons_dir = tmp_path / "lessons"
     jobs_dir = tmp_path / "jobs"
